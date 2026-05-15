@@ -55,7 +55,7 @@ def parse_dzn(path: str) -> dict:
 
     name_m = re.search(r'Instance\s*:\s*(\S+)', text)
     name = name_m.group(1) if name_m else Path(path).stem
-
+     
     data = {
         'name':         name,
         'stem':         Path(path).stem,
@@ -72,6 +72,10 @@ def parse_dzn(path: str) -> dict:
         'ciment':       get_list('ciment'),
         'taches_beton': get_set('TACHES_BETON'),
     }
+       # Extension C — Équipements lourds partagés
+    data['n_equipements'] = get_int('n_equipements')
+    data['capacite_equipement'] = get_list('capacite_equipement')
+    data['besoin_equipement'] = get_matrix('besoin_equipement')
     return data
 
 
@@ -93,7 +97,15 @@ def build_and_solve(data: dict, time_limit: int = 60, gap: float = 0.05) -> dict
     ciment    = data['ciment']
     beton_1   = data['taches_beton']
     beton_0   = [b - 1 for b in beton_1 if 1 <= b <= n]
-
+        # Extension C — Équipements lourds
+    n_eq = data.get('n_equipements', 0)
+    cap_eq = data.get('capacite_equipement', [])
+    req_eq = data.get('besoin_equipement', [])
+    
+    if n_eq > 0 and cap_eq and req_eq:
+        print(f"  Équipements lourds : {n_eq} types")
+        print(f"  Capacités : {cap_eq}")
+        print(f"  Tâches concernées : {sum(1 for i in range(n) for e in range(n_eq) if req_eq[i][e] > 0)}")
     T = H
 
     print(f"\n{'='*65}")
@@ -136,6 +148,22 @@ def build_and_solve(data: dict, time_limit: int = 60, gap: float = 0.05) -> dict
                     for i in range(n) if req[i][r] > 0
                 ) <= cap[r]
             ), f"Res_{r}_{tau}"
+    # ----------------------------------------------------------------
+    # Extension C — Contraintes d'équipements lourds partagés
+    # ----------------------------------------------------------------
+    if n_eq > 0 and cap_eq and req_eq:
+        for e in range(n_eq):
+            for tau in range(T + 1):
+                model += (
+                    pulp.lpSum(
+                        req_eq[i][e] * pulp.lpSum(
+                            x[i][t] for t in range(max(0, tau - d[i] + 1), min(tau + 1, T + 1))
+                        )
+                        for i in range(n) 
+                        if i < len(req_eq) and e < len(req_eq[i]) and req_eq[i][e] > 0
+                    ) <= cap_eq[e]
+                ), f"EquipLourd_{e}_{tau}"
+        print(f"  Contraintes équipements lourds : {n_eq} types × {T+1} pas de temps ajoutées")
 
     model += (
         pulp.lpSum(ciment[i] for i in range(n)) <= stock_NR
