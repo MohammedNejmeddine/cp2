@@ -90,8 +90,8 @@ BESOIN_EQUIPEMENT_J30 = {
 # 2. PARAMETRES D'EXTENSION J120 (NOUVEAUX)
 # ===========================================================================
 
-DEBUT_ETE_J120 = 150
-FIN_ETE_J120   = 240
+DEBUT_ETE_J120 = 200
+FIN_ETE_J120   = 220
 
 STOCK_CIMENT_J120 = {
     "j1201_1":   600,
