@@ -1,202 +1,223 @@
 #!/usr/bin/env python3
 """
-Parser PSPLIB — Projet P2 RCPSP etendu (CP-INSEA-SDRO-2A)
+Parser PSPLIB — Projet P2 RCPSP Étendu (CP-INSEA-SDRO-2A)
 =============================================================
-Lit le fichier instancesdebtp.docx (J30 et J120 melanges),
-parse toutes les instances, et genere les fichiers .dzn 
-avec les 3 extensions BTP marocain + ANALYSE DE SCALABILITE.
-
-CORRECTIONS v2 :
-  - H reduit au minimum viable (sum des durees) pour eviter explosion combinatoire
-  - Indices taches beton et equipements corriges en 1-based (MiniZinc utilise 1..n)
-  - Stock ciment avec marge 1.05 (contrainte active, pas toujours triviale)
-  - Verification coherence indices avant ecriture dzn
+Version CORRIGÉE v3 :
+  - Génère des .dzn compatibles avec le modèle du prof (n_total, n_RR, etc.)
+  - Conserve les dummies (source/puits) comme dans le format PSPLIB original
+  - Format précédences en paires n_prec×2 (compatible modèle prof)
+  - 3 ressources non-renouvelables : Ciment, Acier, Gravier
+  - Analyse de scalabilité sur J30, J60, J90, J120
+  - Génère aussi un fichier de métriques pour comparaison CP vs MILP
 
 Usage:
-    python3 parser_btp.py --input instancesdebtp.docx --outdir dzn_output
-    python3 parser_btp.py --input instancesdebtp.docx --scalabilite
+    python3 parser_btp_v3.py --input instancesdebtp.docx --outdir dzn_output
+    python3 parser_btp_v3.py --input instancesdebtp.docx --scalabilite
 """
 
 import re
 import os
-import argparse
 import sys
 import json
+import argparse
 from pathlib import Path
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional
+from typing import List, Dict, Tuple, Optional
 
 
 # ===========================================================================
-# 1. PARAMETRES D'EXTENSION J30
+# 1. PARAMÈTRES D'EXTENSION BTP MAROCAIN — J30
 # ===========================================================================
 
 DEBUT_ETE_J30 = 80
 FIN_ETE_J30   = 140
 
 def _compute_stocks(ciment_dict: dict, marge: float = 1.05) -> dict:
-    """
-    Calcule stock_NR = sum(ciment) * marge.
-    Marge 1.05 (5%) pour que la contrainte soit active mais faisable.
-    CORRECTION v2 : marge reduite de 1.15 -> 1.05 pour rendre la contrainte utile.
-    """
+    """Calcule stock_NR = sum(ciment) * marge."""
     return {inst: round(sum(vals.values()) * marge) for inst, vals in ciment_dict.items()}
 
+# Indices 1-based (format PSPLIB avec dummies : tâche 1=source, tâche N=puits)
+# Les indices ci-dessous sont les numéros de tâches PSPLIB (1-based avec dummies)
 CIMENT_PAR_TACHE_J30 = {
-    # indices 0-based (position dans le tableau MiniZinc apres conversion)
-    "j301_1":   {1: 40, 2: 35, 5: 50, 8: 30, 11: 45},
-    "j3021_1":  {0: 30, 3: 40, 6: 55, 10: 35, 14: 40},
-    "j3029_1":  {1: 50, 4: 40, 7: 30, 12: 45, 18: 35},
-    "j3045_1":  {0: 40, 3: 50, 6: 35, 9: 40, 15: 30},
-    "j3082_1":  {2: 35, 3: 18, 4: 22, 5: 25, 6: 22, 7: 25, 8: 28},
+    "j301_1":   {4: 40, 5: 35, 8: 50, 11: 30, 14: 45},    # j30_17
+    "j3021_1":  {3: 30, 6: 40, 9: 55, 13: 35, 17: 40},    # j30_37
+    "j3029_1":  {4: 50, 7: 40, 10: 30, 15: 45, 21: 35},   # j30_45
+    "j3045_1":  {3: 40, 6: 50, 9: 35, 12: 40, 18: 30},    # j30_61
+    "j3082_1":  {5: 35, 6: 18, 7: 22, 8: 25, 9: 22, 10: 25, 11: 28},  # j30_82
 }
 
 STOCK_CIMENT_J30 = _compute_stocks(CIMENT_PAR_TACHE_J30)
 
-# CORRECTION v2 : indices 0-based, seront convertis en 1-based dans to_dzn()
+# Tâches béton identifiées par leurs numéros PSPLIB (1-based avec dummies)
 TACHES_BETON_J30 = {
-    "j301_1":   [2, 3, 6, 9, 12],
-    "j3021_1":  [1, 4, 7, 11, 15],
-    "j3029_1":  [2, 5, 8, 13, 19],
-    "j3045_1":  [1, 4, 7, 10, 16],
-    "j3082_1":  [4, 5, 6, 7, 8, 9, 10],
+    "j301_1":   [4, 5, 8, 11, 14],       # j30_17
+    "j3021_1":  [3, 6, 9, 13, 17],       # j30_37
+    "j3029_1":  [4, 7, 10, 15, 21],      # j30_45
+    "j3045_1":  [3, 6, 9, 12, 18],       # j30_61
+    "j3082_1":  [5, 6, 7, 8, 9, 10, 11], # j30_82
 }
 
-N_EQUIPEMENTS_J30 = {
-    "j301_1":   2, "j3021_1":  2, "j3029_1":  2,
-    "j3045_1":  2, "j3082_1":  2,
+# Acier et Gravier (mêmes tâches que ciment, proportions différentes)
+ACIER_PAR_TACHE_J30 = {
+    "j301_1":   {4: 8, 5: 6, 8: 12, 11: 5, 14: 10},
+    "j3021_1":  {3: 6, 6: 9, 9: 14, 13: 7, 17: 9},
+    "j3029_1":  {4: 10, 7: 8, 10: 5, 15: 9, 21: 7},
+    "j3045_1":  {3: 8, 6: 12, 9: 7, 12: 8, 18: 5},
+    "j3082_1":  {5: 7, 6: 3, 7: 4, 8: 5, 9: 4, 10: 5, 11: 6},
 }
 
-CAPACITE_EQUIPEMENT_J30 = {
-    "j301_1":   [2, 1], "j3021_1":  [2, 1], "j3029_1":  [2, 1],
-    "j3045_1":  [2, 1], "j3082_1":  [1, 1],
+STOCK_ACIER_J30 = _compute_stocks(ACIER_PAR_TACHE_J30, marge=1.05)
+
+GRAVIER_PAR_TACHE_J30 = {
+    "j301_1":   {4: 70, 5: 45, 8: 90, 11: 40, 14: 75},
+    "j3021_1":  {3: 55, 6: 75, 9: 95, 13: 55, 17: 70},
+    "j3029_1":  {4: 90, 7: 70, 10: 50, 15: 80, 21: 65},
+    "j3045_1":  {3: 70, 6: 85, 9: 60, 12: 70, 18: 50},
+    "j3082_1":  {5: 60, 6: 35, 7: 45, 8: 50, 9: 45, 10: 50, 11: 55},
 }
 
-# indices 0-based, seront convertis en 1-based dans to_dzn()
-BESOIN_EQUIPEMENT_J30 = {
-    "j301_1": {
-        1:  [1, 1], 2:  [1, 1], 5:  [1, 1], 8:  [1, 1], 11: [1, 1],
-        3:  [1, 0], 6:  [1, 0], 9:  [1, 0], 12: [1, 0],
-    },
-    "j3021_1": {
-        0:  [1, 1], 3:  [1, 1], 6:  [1, 1], 10: [1, 1], 14: [1, 1],
-        1:  [1, 0], 4:  [1, 0], 7:  [1, 0], 11: [1, 0],
-    },
-    "j3029_1": {
-        1:  [1, 1], 4:  [1, 1], 7:  [1, 1], 12: [1, 1], 18: [1, 1],
-        2:  [1, 0], 5:  [1, 0], 8:  [1, 0], 13: [1, 0],
-    },
-    "j3045_1": {
-        0:  [1, 1], 3:  [1, 1], 6:  [1, 1], 9:  [1, 1], 15: [1, 1],
-        1:  [1, 0], 4:  [1, 0], 7:  [1, 0], 10: [1, 0],
-    },
-    "j3082_1": {
-        2:  [1, 1], 3:  [1, 1], 4:  [1, 1], 5:  [1, 1], 6:  [1, 1],
-        7:  [1, 1], 8:  [1, 1], 9:  [1, 0], 10: [1, 0],
-    },
-}
+STOCK_GRAVIER_J30 = _compute_stocks(GRAVIER_PAR_TACHE_J30, marge=1.05)
 
 
 # ===========================================================================
-# 2. PARAMETRES D'EXTENSION J120
+# 2. PARAMÈTRES D'EXTENSION — J60
+# ===========================================================================
+
+DEBUT_ETE_J60 = 120
+FIN_ETE_J60   = 200
+
+CIMENT_PAR_TACHE_J60 = {
+    "j601_1":   {3: 35, 7: 45, 12: 30, 18: 50, 25: 40, 32: 35, 40: 45, 48: 30, 55: 40},
+    "j601_2":   {4: 40, 9: 35, 15: 50, 22: 30, 28: 45, 35: 35, 42: 50, 50: 30, 58: 40},
+    "j601_3":   {5: 45, 10: 40, 16: 35, 20: 50, 27: 30, 33: 45, 38: 35, 45: 50, 52: 30},
+    "j601_4":   {2: 30, 6: 50, 14: 40, 19: 35, 24: 45, 30: 30, 36: 50, 44: 40, 51: 35},
+}
+
+STOCK_CIMENT_J60 = _compute_stocks(CIMENT_PAR_TACHE_J60)
+
+TACHES_BETON_J60 = {
+    "j601_1":   [3, 7, 12, 18, 25, 32, 40, 48, 55],
+    "j601_2":   [4, 9, 15, 22, 28, 35, 42, 50, 58],
+    "j601_3":   [5, 10, 16, 20, 27, 33, 38, 45, 52],
+    "j601_4":   [2, 6, 14, 19, 24, 30, 36, 44, 51],
+}
+
+ACIER_PAR_TACHE_J60 = {
+    "j601_1":   {3: 7, 7: 9, 12: 6, 18: 10, 25: 8, 32: 7, 40: 9, 48: 6, 55: 8},
+    "j601_2":   {4: 8, 9: 7, 15: 10, 22: 6, 28: 9, 35: 7, 42: 10, 50: 6, 58: 8},
+    "j601_3":   {5: 9, 10: 8, 16: 7, 20: 10, 27: 6, 33: 9, 38: 7, 45: 10, 52: 6},
+    "j601_4":   {2: 6, 6: 10, 14: 8, 19: 7, 24: 9, 30: 6, 36: 10, 44: 8, 51: 7},
+}
+
+STOCK_ACIER_J60 = _compute_stocks(ACIER_PAR_TACHE_J60, marge=1.05)
+
+GRAVIER_PAR_TACHE_J60 = {
+    "j601_1":   {3: 60, 7: 80, 12: 55, 18: 90, 25: 75, 32: 65, 40: 80, 48: 55, 55: 75},
+    "j601_2":   {4: 70, 9: 60, 15: 85, 22: 55, 28: 80, 35: 65, 42: 85, 50: 55, 58: 70},
+    "j601_3":   {5: 80, 10: 70, 16: 60, 20: 85, 27: 55, 33: 80, 38: 65, 45: 85, 52: 55},
+    "j601_4":   {2: 55, 6: 85, 14: 70, 19: 60, 24: 80, 30: 55, 36: 85, 44: 70, 51: 60},
+}
+
+STOCK_GRAVIER_J60 = _compute_stocks(GRAVIER_PAR_TACHE_J60, marge=1.05)
+
+
+# ===========================================================================
+# 3. PARAMÈTRES D'EXTENSION — J90
+# ===========================================================================
+
+DEBUT_ETE_J90 = 150
+FIN_ETE_J90   = 240
+
+CIMENT_PAR_TACHE_J90 = {
+    "j901_1":   {4: 40, 10: 35, 18: 50, 25: 30, 32: 45, 40: 35, 48: 50, 55: 30, 62: 40, 70: 35, 78: 45},
+    "j901_2":   {5: 45, 12: 40, 20: 35, 28: 50, 35: 30, 42: 45, 50: 35, 58: 50, 65: 30, 72: 40, 80: 35},
+    "j901_3":   {3: 35, 8: 50, 15: 40, 22: 35, 30: 50, 38: 30, 45: 45, 52: 35, 60: 50, 68: 30, 75: 40},
+    "j901_4":   {6: 50, 14: 35, 21: 45, 29: 30, 36: 50, 44: 35, 51: 45, 59: 30, 66: 50, 74: 35, 82: 45},
+}
+
+STOCK_CIMENT_J90 = _compute_stocks(CIMENT_PAR_TACHE_J90)
+
+TACHES_BETON_J90 = {
+    "j901_1":   [4, 10, 18, 25, 32, 40, 48, 55, 62, 70, 78],
+    "j901_2":   [5, 12, 20, 28, 35, 42, 50, 58, 65, 72, 80],
+    "j901_3":   [3, 8, 15, 22, 30, 38, 45, 52, 60, 68, 75],
+    "j901_4":   [6, 14, 21, 29, 36, 44, 51, 59, 66, 74, 82],
+}
+
+ACIER_PAR_TACHE_J90 = {
+    "j901_1":   {4: 8, 10: 7, 18: 10, 25: 6, 32: 9, 40: 7, 48: 10, 55: 6, 62: 8, 70: 7, 78: 9},
+    "j901_2":   {5: 9, 12: 8, 20: 7, 28: 10, 35: 6, 42: 9, 50: 7, 58: 10, 65: 6, 72: 8, 80: 7},
+    "j901_3":   {3: 7, 8: 10, 15: 8, 22: 7, 30: 10, 38: 6, 45: 9, 52: 7, 60: 10, 68: 6, 75: 8},
+    "j901_4":   {6: 10, 14: 7, 21: 9, 29: 6, 36: 10, 44: 7, 51: 9, 59: 6, 66: 10, 74: 7, 82: 9},
+}
+
+STOCK_ACIER_J90 = _compute_stocks(ACIER_PAR_TACHE_J90, marge=1.05)
+
+GRAVIER_PAR_TACHE_J90 = {
+    "j901_1":   {4: 70, 10: 60, 18: 90, 25: 55, 32: 80, 40: 65, 48: 90, 55: 55, 62: 75, 70: 65, 78: 80},
+    "j901_2":   {5: 80, 12: 70, 20: 60, 28: 85, 35: 55, 42: 80, 50: 65, 58: 85, 65: 55, 72: 75, 80: 65},
+    "j901_3":   {3: 60, 8: 85, 15: 70, 22: 60, 30: 85, 38: 55, 45: 80, 52: 65, 60: 85, 68: 55, 75: 75},
+    "j901_4":   {6: 85, 14: 60, 21: 80, 29: 55, 36: 85, 44: 60, 51: 80, 59: 55, 66: 85, 74: 60, 82: 80},
+}
+
+STOCK_GRAVIER_J90 = _compute_stocks(GRAVIER_PAR_TACHE_J90, marge=1.05)
+
+
+# ===========================================================================
+# 4. PARAMÈTRES D'EXTENSION — J120
 # ===========================================================================
 
 DEBUT_ETE_J120 = 200
-FIN_ETE_J120   = 220
+FIN_ETE_J120   = 300
 
 CIMENT_PAR_TACHE_J120 = {
     "j1201_1": {
-        2: 40, 5: 35, 8: 50, 12: 30, 15: 45,
-        18: 35, 22: 40, 25: 50, 30: 30, 35: 45,
-        40: 35, 45: 40, 50: 30, 55: 45, 60: 35,
-        65: 40, 70: 30, 75: 45, 80: 35, 85: 40,
+        3: 40, 8: 35, 15: 50, 22: 30, 30: 45, 38: 35, 45: 50, 52: 30, 60: 40,
+        68: 35, 75: 45, 82: 30, 90: 50, 98: 35, 105: 40,
     },
     "j1201_2": {
-        1: 35, 4: 45, 7: 30, 10: 50, 14: 35,
-        18: 40, 22: 30, 26: 45, 30: 35, 34: 50,
-        38: 30, 42: 45, 46: 35, 50: 40, 54: 30,
-        58: 45, 62: 35, 66: 40, 70: 30, 74: 45,
+        4: 45, 10: 40, 18: 35, 25: 50, 32: 30, 40: 45, 48: 35, 55: 50, 62: 30,
+        70: 40, 78: 35, 85: 45, 92: 30, 100: 50, 108: 35,
     },
     "j1201_3": {
-        3: 40, 6: 35, 9: 50, 13: 30, 17: 45,
-        21: 35, 25: 40, 29: 30, 33: 45, 37: 35,
-        41: 40, 45: 30, 49: 45, 53: 35, 57: 40,
-        61: 30, 65: 45, 69: 35, 73: 40, 77: 30,
+        5: 50, 12: 35, 20: 45, 28: 30, 35: 50, 42: 35, 50: 45, 58: 30, 65: 50,
+        72: 35, 80: 45, 88: 30, 95: 50, 102: 35, 110: 45,
     },
     "j1201_4": {
-        0: 45, 4: 30, 8: 50, 12: 35, 16: 40,
-        20: 30, 24: 45, 28: 35, 32: 40, 36: 30,
-        40: 45, 44: 35, 48: 40, 52: 30, 56: 45,
-        60: 35, 64: 40, 68: 30, 72: 45, 76: 35,
+        2: 35, 9: 50, 16: 30, 24: 45, 31: 35, 39: 50, 46: 30, 54: 45, 61: 35,
+        69: 50, 76: 30, 84: 45, 91: 35, 99: 50, 107: 30,
     },
 }
 
 STOCK_CIMENT_J120 = _compute_stocks(CIMENT_PAR_TACHE_J120)
 
-# indices 0-based, seront convertis en 1-based dans to_dzn()
 TACHES_BETON_J120 = {
-    "j1201_1":  [3, 6, 9, 13, 16, 19, 23, 26, 31, 36, 41, 46, 51, 56, 61, 66, 71, 76, 81, 86],
-    "j1201_2":  [2, 5, 8, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63, 67, 71, 75],
-    "j1201_3":  [4, 7, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62, 66, 70, 74, 78],
-    "j1201_4":  [1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57, 61, 65, 69, 73, 77],
+    "j1201_1":  [3, 8, 15, 22, 30, 38, 45, 52, 60, 68, 75, 82, 90, 98, 105],
+    "j1201_2":  [4, 10, 18, 25, 32, 40, 48, 55, 62, 70, 78, 85, 92, 100, 108],
+    "j1201_3":  [5, 12, 20, 28, 35, 42, 50, 58, 65, 72, 80, 88, 95, 102, 110],
+    "j1201_4":  [2, 9, 16, 24, 31, 39, 46, 54, 61, 69, 76, 84, 91, 99, 107],
 }
 
-N_EQUIPEMENTS_J120 = {
-    "j1201_1":  3, "j1201_2":  3, "j1201_3":  3, "j1201_4":  3,
+ACIER_PAR_TACHE_J120 = {
+    "j1201_1": {3: 8, 8: 7, 15: 10, 22: 6, 30: 9, 38: 7, 45: 10, 52: 6, 60: 8, 68: 7, 75: 9, 82: 6, 90: 10, 98: 7, 105: 8},
+    "j1201_2": {4: 9, 10: 8, 18: 7, 25: 10, 32: 6, 40: 9, 48: 7, 55: 10, 62: 6, 70: 8, 78: 7, 85: 9, 92: 6, 100: 10, 108: 7},
+    "j1201_3": {5: 10, 12: 7, 20: 9, 28: 6, 35: 10, 42: 7, 50: 9, 58: 6, 65: 10, 72: 7, 80: 9, 88: 6, 95: 10, 102: 7, 110: 9},
+    "j1201_4": {2: 7, 9: 10, 16: 6, 24: 9, 31: 7, 39: 10, 46: 6, 54: 9, 61: 7, 69: 10, 76: 6, 84: 9, 91: 7, 99: 10, 107: 6},
 }
 
-CAPACITE_EQUIPEMENT_J120 = {
-    "j1201_1":  [2, 1, 2], "j1201_2":  [2, 1, 2],
-    "j1201_3":  [2, 1, 2], "j1201_4":  [2, 1, 2],
+STOCK_ACIER_J120 = _compute_stocks(ACIER_PAR_TACHE_J120, marge=1.05)
+
+GRAVIER_PAR_TACHE_J120 = {
+    "j1201_1": {3: 70, 8: 60, 15: 90, 22: 55, 30: 80, 38: 65, 45: 90, 52: 55, 60: 75, 68: 65, 75: 80, 82: 55, 90: 90, 98: 65, 105: 70},
+    "j1201_2": {4: 80, 10: 70, 18: 60, 25: 85, 32: 55, 40: 80, 48: 65, 55: 85, 62: 55, 70: 75, 78: 65, 85: 80, 92: 55, 100: 85, 108: 65},
+    "j1201_3": {5: 85, 12: 60, 20: 80, 28: 55, 35: 85, 42: 60, 50: 80, 58: 55, 65: 85, 72: 60, 80: 80, 88: 55, 95: 85, 102: 60, 110: 80},
+    "j1201_4": {2: 60, 9: 85, 16: 55, 24: 80, 31: 60, 39: 85, 46: 55, 54: 80, 61: 60, 69: 85, 76: 55, 84: 80, 91: 60, 99: 85, 107: 55},
 }
 
-# indices 0-based, seront convertis en 1-based dans to_dzn()
-BESOIN_EQUIPEMENT_J120 = {
-    "j1201_1": {
-        2:  [1, 1, 0], 5:  [1, 1, 0], 8:  [1, 1, 0], 12: [1, 1, 0], 15: [1, 1, 0],
-        18: [1, 1, 0], 22: [1, 1, 0], 25: [1, 1, 0], 30: [1, 1, 0], 35: [1, 1, 0],
-        0:  [0, 0, 1], 10: [0, 0, 1], 20: [0, 0, 1], 40: [0, 0, 1], 50: [0, 0, 1],
-        60: [0, 0, 1], 70: [0, 0, 1], 80: [0, 0, 1],
-        4:  [1, 0, 0], 9:  [1, 0, 0], 14: [1, 0, 0], 19: [1, 0, 0], 24: [1, 0, 0],
-        29: [1, 0, 0], 34: [1, 0, 0], 39: [1, 0, 0], 44: [1, 0, 0], 49: [1, 0, 0],
-        54: [1, 0, 0], 59: [1, 0, 0], 64: [1, 0, 0], 69: [1, 0, 0], 74: [1, 0, 0],
-        79: [1, 0, 0], 84: [1, 0, 0],
-    },
-    "j1201_2": {
-        1:  [1, 1, 0], 4:  [1, 1, 0], 7:  [1, 1, 0], 10: [1, 1, 0], 15: [1, 1, 0],
-        19: [1, 1, 0], 23: [1, 1, 0], 27: [1, 1, 0], 31: [1, 1, 0], 35: [1, 1, 0],
-        0:  [0, 0, 1], 11: [0, 0, 1], 21: [0, 0, 1], 41: [0, 0, 1], 51: [0, 0, 1],
-        61: [0, 0, 1], 71: [0, 0, 1],
-        3:  [1, 0, 0], 8:  [1, 0, 0], 13: [1, 0, 0], 18: [1, 0, 0], 22: [1, 0, 0],
-        26: [1, 0, 0], 30: [1, 0, 0], 34: [1, 0, 0], 38: [1, 0, 0], 42: [1, 0, 0],
-        46: [1, 0, 0], 50: [1, 0, 0], 54: [1, 0, 0], 58: [1, 0, 0], 62: [1, 0, 0],
-        66: [1, 0, 0], 70: [1, 0, 0], 74: [1, 0, 0],
-    },
-    "j1201_3": {
-        3:  [1, 1, 0], 6:  [1, 1, 0], 9:  [1, 1, 0], 13: [1, 1, 0], 17: [1, 1, 0],
-        21: [1, 1, 0], 25: [1, 1, 0], 29: [1, 1, 0], 33: [1, 1, 0], 37: [1, 1, 0],
-        1:  [0, 0, 1], 12: [0, 0, 1], 22: [0, 0, 1], 32: [0, 0, 1], 42: [0, 0, 1],
-        52: [0, 0, 1], 62: [0, 0, 1], 72: [0, 0, 1],
-        0:  [1, 0, 0], 5:  [1, 0, 0], 10: [1, 0, 0], 15: [1, 0, 0], 20: [1, 0, 0],
-        24: [1, 0, 0], 28: [1, 0, 0], 31: [1, 0, 0], 35: [1, 0, 0], 39: [1, 0, 0],
-        44: [1, 0, 0], 48: [1, 0, 0], 53: [1, 0, 0], 57: [1, 0, 0], 61: [1, 0, 0],
-        65: [1, 0, 0], 69: [1, 0, 0], 73: [1, 0, 0], 77: [1, 0, 0],
-    },
-    "j1201_4": {
-        0:  [1, 1, 0], 4:  [1, 1, 0], 8:  [1, 1, 0], 12: [1, 1, 0], 16: [1, 1, 0],
-        20: [1, 1, 0], 24: [1, 1, 0], 28: [1, 1, 0], 32: [1, 1, 0], 36: [1, 1, 0],
-        2:  [0, 0, 1], 13: [0, 0, 1], 23: [0, 0, 1], 33: [0, 0, 1], 43: [0, 0, 1],
-        53: [0, 0, 1], 63: [0, 0, 1], 73: [0, 0, 1],
-        3:  [1, 0, 0], 7:  [1, 0, 0], 11: [1, 0, 0], 15: [1, 0, 0], 19: [1, 0, 0],
-        22: [1, 0, 0], 26: [1, 0, 0], 30: [1, 0, 0], 34: [1, 0, 0], 38: [1, 0, 0],
-        42: [1, 0, 0], 46: [1, 0, 0], 50: [1, 0, 0], 54: [1, 0, 0], 58: [1, 0, 0],
-        62: [1, 0, 0], 66: [1, 0, 0], 70: [1, 0, 0], 74: [1, 0, 0],
-    },
-}
+STOCK_GRAVIER_J120 = _compute_stocks(GRAVIER_PAR_TACHE_J120, marge=1.05)
 
 
 # ===========================================================================
-# 3. MAPPING NOMS BASEDATA -> CLES DICO
+# 5. MAPPING NOMS BASEDATA -> CLÉS DICO
 # ===========================================================================
 
 NAME_MAPPING = {
@@ -206,6 +227,16 @@ NAME_MAPPING = {
     "j30_45":   "j3029_1",
     "j30_61":   "j3045_1",
     "j30_82":   "j3082_1",
+    # J60
+    "j60_1":    "j601_1",
+    "j60_2":    "j601_2",
+    "j60_3":    "j601_3",
+    "j60_4":    "j601_4",
+    # J90
+    "j90_1":    "j901_1",
+    "j90_2":    "j901_2",
+    "j90_3":    "j901_3",
+    "j90_4":    "j901_4",
     # J120
     "j1201_1":  "j1201_1",
     "j1201_2":  "j1201_2",
@@ -215,22 +246,35 @@ NAME_MAPPING = {
 
 
 def get_instance_key(basedata_name: str) -> str:
-    """Convertit le nom basedata en cle de dictionnaire"""
+    """Convertit le nom basedata en clé de dictionnaire"""
     clean = basedata_name.lower().replace('.bas', '').replace('.sm', '').strip()
     if clean in NAME_MAPPING:
         return NAME_MAPPING[clean]
     return clean
 
 
+def get_instance_type(stem: str) -> str:
+    """Détermine le type d'instance (J30, J60, J90, J120)"""
+    if stem.startswith('j120'):
+        return 'J120'
+    elif stem.startswith('j90'):
+        return 'J90'
+    elif stem.startswith('j60'):
+        return 'J60'
+    elif stem.startswith('j30'):
+        return 'J30'
+    return 'UNKNOWN'
+
+
 # ===========================================================================
-# 4. FONCTIONS COMMUNES
+# 6. FONCTIONS UTILITAIRES
 # ===========================================================================
 
 def extract_text_from_docx(docx_path: str) -> str:
     try:
         import docx as _docx
     except ImportError:
-        raise RuntimeError("python-docx non installe. Lancez : pip3 install python-docx")
+        raise RuntimeError("python-docx non installé. Lancez : pip3 install python-docx")
     doc = _docx.Document(docx_path)
     lines = []
     for table in doc.tables:
@@ -260,13 +304,13 @@ def format_2d(matrix: list) -> str:
 
 
 # ===========================================================================
-# 5. PARSING D'UN BLOC (J30 ou J120)
+# 7. PARSING D'UN BLOC PSPLIB
 # ===========================================================================
 
 def parse_block(content: str) -> dict:
-    """Parse un bloc d'instance PSPLIB (J30 ou J120)"""
+    """Parse un bloc d'instance PSPLIB (format standard)"""
 
-    # === DETECTION DU NOM D'INSTANCE ===
+    # Détection du nom d'instance
     bas_match = re.search(r'file with basedata\s*:\s*(\S+)', content, re.IGNORECASE)
 
     if bas_match:
@@ -274,7 +318,7 @@ def parse_block(content: str) -> dict:
         stem_raw = re.sub(r'\.(bas|sm)$', '', basedata, flags=re.IGNORECASE)
         stem = stem_raw.lower()
         instance_key = get_instance_key(stem)
-        is_j120 = stem.startswith('j120')
+        inst_type = get_instance_type(stem)
         name = instance_key + ".sm"
     else:
         name_match = re.search(r'^(j\d+_\d+\.sm)', content)
@@ -282,19 +326,18 @@ def parse_block(content: str) -> dict:
             name = name_match.group(1)
             stem = re.sub(r'\.sm$', '', name)
             instance_key = get_instance_key(stem)
-            is_j120 = stem.startswith('j120')
+            inst_type = get_instance_type(stem)
         else:
             raise ValueError("Impossible de trouver le nom de l'instance dans le bloc.")
 
-    # === EXTRACTION METADONNEES ===
+    # Extraction métadonnées
     jobs_match = re.search(r'[Jj]obs.*?[:]\s*(\d+)', content)
-    n_jobs = int(jobs_match.group(1)) if jobs_match else (122 if is_j120 else 32)
-    n_real = n_jobs - 2
+    n_jobs = int(jobs_match.group(1)) if jobs_match else 32
 
     res_match = re.search(r'[Rr]enewable\s*[:=]\s*(\d+)', content)
     n_res = int(res_match.group(1)) if res_match else 4
 
-    # === PRECEDENCES ===
+    # Précédences (format successeurs PSPLIB)
     prec_match = re.search(
         r'PRECEDENCE\s*RELATIONS\s*[:=]?\s*(.*?)\s*REQUESTS',
         content, re.DOTALL | re.IGNORECASE
@@ -318,7 +361,7 @@ def parse_block(content: str) -> dict:
                 except (ValueError, IndexError):
                     continue
 
-    # === DUREES ET DEMANDES ===
+    # Durées et demandes
     req_match = re.search(
         r'REQUESTS/DURATIONS\s*[:=]?\s*(.*?)\s*RESOURCE\s*AVAIL',
         content, re.DOTALL | re.IGNORECASE
@@ -344,7 +387,7 @@ def parse_block(content: str) -> dict:
                 except (ValueError, IndexError):
                     continue
 
-    # === CAPACITES ===
+    # Capacités
     cap_match = re.search(
         r'RESOURCE\s*AVAILABILITIES\s*[:=]?\s*(.*?)(?:\*{5}|\Z)',
         content, re.DOTALL | re.IGNORECASE
@@ -368,90 +411,84 @@ def parse_block(content: str) -> dict:
     if not caps:
         caps = [10, 10, 10, 10][:n_res]
 
-    # === REORGANISATION 0-BASED ===
-    real_jobs = list(range(2, n_jobs))
-    n = len(real_jobs)
+    # Reconstruction avec dummies (toutes les tâches 1..n_jobs)
+    n_total = n_jobs
 
-    durations = [durations_raw.get(j, 0) for j in real_jobs]
-    demands = [demands_raw.get(j, [0]*n_res) for j in real_jobs]
+    # Durées pour toutes les tâches (1..n_total)
+    durations = [durations_raw.get(j, 0) for j in range(1, n_total + 1)]
 
-    prec_matrix = [[0] * n for _ in range(n)]
-    job_map = {j: i for i, j in enumerate(real_jobs)}
+    # Demandes pour toutes les tâches
+    demands = [demands_raw.get(j, [0]*n_res) for j in range(1, n_total + 1)]
 
+    # Précédences en format paires (compatible modèle prof)
+    prec_pairs = []
     for job, succs in successors_raw.items():
-        if job in job_map:
-            for s in succs:
-                if s in job_map:
-                    prec_matrix[job_map[job]][job_map[s]] = 1
+        for s in succs:
+            prec_pairs.append([job, s])
+    n_prec = len(prec_pairs)
 
-    # =========================================================
-    # CORRECTION v2 : H reduit au minimum viable
-    # H_parse peut etre tres grand (ex: 800 pour J120)
-    # On le plafonne a sum(durees) qui est une borne sup theorique
-    # Cela reduit drastiquement le domaine des variables MiniZinc
-    # =========================================================
+    # Horizon
     H_match = re.search(r'[Hh]orizon\s*[:=]\s*(\d+)', content)
-    H_parsed = int(H_match.group(1)) if H_match else (800 if is_j120 else 200)
-    H_min = sum(durations) if durations else H_parsed
-    H = min(H_parsed, H_min)
-
-    # Securite : H ne peut pas etre 0 ou negatif
-    if H <= 0:
-        H = H_parsed if H_parsed > 0 else (800 if is_j120 else 200)
+    H = int(H_match.group(1)) if H_match else (800 if inst_type == 'J120' else 400)
 
     return {
         'name': name,
         'stem': instance_key,
         'stem_raw': stem,
-        'is_j120': is_j120,
-        'n': n,
+        'inst_type': inst_type,
+        'n_total': n_total,
         'H': H,
-        'H_original': H_parsed,
         'n_res': n_res,
         'caps': caps,
         'durations': durations,
         'demands': demands,
-        'prec_matrix': prec_matrix,
+        'prec_pairs': prec_pairs,
+        'n_prec': n_prec,
     }
 
 
 # ===========================================================================
-# 6. METRIQUES DE SCALABILITE
+# 8. MÉTRIQUES DE SCALABILITÉ
 # ===========================================================================
 
 def compute_metrics(data: dict) -> dict:
-    """Calcule les metriques RF, RS, NC, etc."""
-    n = data['n']
+    """Calcule les métriques RF, RS, NC, etc."""
+    n_total = data['n_total']
     n_res = data['n_res']
     caps = data['caps']
     demands = data['demands']
     durations = data['durations']
-    prec_matrix = data['prec_matrix']
+
+    # Tâches réelles (sans dummies)
+    real_demands = demands[1:-1] if n_total > 2 else demands
+    real_durations = durations[1:-1] if n_total > 2 else durations
+    n_real = len(real_demands)
 
     # RF: Resource Factor
-    uses_res = sum(1 for d in demands if any(x > 0 for x in d))
-    rf = round(uses_res / n, 3) if n > 0 else 0
+    uses_res = sum(1 for d in real_demands if any(x > 0 for x in d))
+    rf = round(uses_res / n_real, 3) if n_real > 0 else 0
 
     # RS: Resource Strength
     rs_vals = []
     for r in range(n_res):
-        col = [demands[i][r] for i in range(n)]
+        col = [demands[i][r] for i in range(n_total)]
         mx = max(col) if col else 1
         if mx > 0:
             rs_vals.append(round(caps[r] / mx, 3))
     rs = round(sum(rs_vals) / len(rs_vals), 3) if rs_vals else 0
 
-    # NC: Network Complexity (Order Strength)
-    total_prec = sum(prec_matrix[i][j] for i in range(n) for j in range(n))
-    max_prec = n * (n - 1) / 2
-    nc = round(total_prec / max_prec, 3) if max_prec > 0 else 0
+    # NC: Network Complexity
+    n_prec = data['n_prec']
+    max_prec = n_total * (n_total - 1) / 2
+    nc = round(n_prec / max_prec, 3) if max_prec > 0 else 0
 
-    total_work = sum(durations)
-    avg_duration = round(total_work / n, 1) if n > 0 else 0
+    total_work = sum(real_durations)
+    avg_duration = round(total_work / n_real, 1) if n_real > 0 else 0
 
+    # Utilisation des ressources
     util = {}
     for r in range(n_res):
-        total_demand = sum(demands[i][r] * durations[i] for i in range(n))
+        total_demand = sum(demands[i][r] * durations[i] for i in range(n_total))
         capacity = caps[r] * data['H']
         util[f"R{r+1}"] = round(total_demand / capacity, 3) if capacity > 0 else 0
 
@@ -462,11 +499,12 @@ def compute_metrics(data: dict) -> dict:
         'total_work': total_work,
         'avg_duration': avg_duration,
         'utilization': util,
+        'n_real': n_real,
     }
 
 
 def analyze_scalability(all_data: list) -> dict:
-    """Analyse de scalabilite entre toutes les instances"""
+    """Analyse de scalabilité entre toutes les instances"""
     results = []
 
     for data in all_data:
@@ -474,10 +512,10 @@ def analyze_scalability(all_data: list) -> dict:
         info = {
             'name': data['name'],
             'stem': data['stem'],
-            'type': 'J120' if data['is_j120'] else 'J30',
-            'n_jobs': data['n'],
+            'type': data['inst_type'],
+            'n_total': data['n_total'],
+            'n_real': metrics['n_real'],
             'horizon': data['H'],
-            'horizon_original': data.get('H_original', data['H']),
             'n_resources': data['n_res'],
             'caps': data['caps'],
             'rf': metrics['rf'],
@@ -489,230 +527,227 @@ def analyze_scalability(all_data: list) -> dict:
         }
         results.append(info)
 
-    j30_instances = [r for r in results if r['type'] == 'J30']
-    j120_instances = [r for r in results if r['type'] == 'J120']
+    # Regroupement par type
+    by_type = {}
+    for r in results:
+        t = r['type']
+        if t not in by_type:
+            by_type[t] = []
+        by_type[t].append(r)
 
+    # Ratios de scalabilité
     summary = {}
-    if j30_instances and j120_instances:
-        avg_j30_jobs    = sum(r['n_jobs']      for r in j30_instances)  / len(j30_instances)
-        avg_j120_jobs   = sum(r['n_jobs']      for r in j120_instances) / len(j120_instances)
-        avg_j30_horizon = sum(r['horizon']     for r in j30_instances)  / len(j30_instances)
-        avg_j120_horizon= sum(r['horizon']     for r in j120_instances) / len(j120_instances)
-        avg_j30_work    = sum(r['total_work']  for r in j30_instances)  / len(j30_instances)
-        avg_j120_work   = sum(r['total_work']  for r in j120_instances) / len(j120_instances)
+    types = ['J30', 'J60', 'J90', 'J120']
+    for t in types:
+        if t in by_type:
+            insts = by_type[t]
+            summary[t] = {
+                'count': len(insts),
+                'avg_jobs': round(sum(r['n_real'] for r in insts) / len(insts), 1),
+                'avg_horizon': round(sum(r['horizon'] for r in insts) / len(insts), 1),
+                'avg_work': round(sum(r['total_work'] for r in insts) / len(insts), 1),
+                'avg_rf': round(sum(r['rf'] for r in insts) / len(insts), 3),
+                'avg_rs': round(sum(r['rs'] for r in insts) / len(insts), 3),
+                'avg_nc': round(sum(r['nc'] for r in insts) / len(insts), 3),
+            }
 
-        summary = {
-            'ratio_jobs_j120_j30':    round(avg_j120_jobs    / avg_j30_jobs,    2) if avg_j30_jobs    > 0 else 0,
-            'ratio_horizon_j120_j30': round(avg_j120_horizon / avg_j30_horizon, 2) if avg_j30_horizon > 0 else 0,
-            'ratio_work_j120_j30':    round(avg_j120_work    / avg_j30_work,    2) if avg_j30_work    > 0 else 0,
-            'avg_rf_j30':  round(sum(r['rf'] for r in j30_instances)  / len(j30_instances),  3),
-            'avg_rf_j120': round(sum(r['rf'] for r in j120_instances) / len(j120_instances), 3),
-            'avg_rs_j30':  round(sum(r['rs'] for r in j30_instances)  / len(j30_instances),  3),
-            'avg_rs_j120': round(sum(r['rs'] for r in j120_instances) / len(j120_instances), 3),
-            'avg_nc_j30':  round(sum(r['nc'] for r in j30_instances)  / len(j30_instances),  3),
-            'avg_nc_j120': round(sum(r['nc'] for r in j120_instances) / len(j120_instances), 3),
-        }
-
-    return {'instances': results, 'summary': summary}
+    return {'instances': results, 'summary': summary, 'by_type': by_type}
 
 
 # ===========================================================================
-# 7. GENERATION DZN — CORRECTION v2 : indices 1-based pour MiniZinc
+# 9. GÉNÉRATION DZN — Compatible modèle du prof
 # ===========================================================================
 
 def to_dzn(data: dict, out_path: str) -> None:
-    stem    = data['stem']
-    is_j120 = data['is_j120']
-    n       = data['n']
+    """Génère un fichier .dzn compatible avec le modèle du prof"""
+    stem = data['stem']
+    inst_type = data['inst_type']
+    n_total = data['n_total']
 
-    if is_j120:
-        debut_ete           = DEBUT_ETE_J120
-        fin_ete             = FIN_ETE_J120
-        stock_ciment        = STOCK_CIMENT_J120.get(stem, 600)
-        ciment_par_tache    = CIMENT_PAR_TACHE_J120.get(stem, {})
-        taches_beton_0based = TACHES_BETON_J120.get(stem, [])
-        n_equipements       = N_EQUIPEMENTS_J120.get(stem, 3)
-        capacite_equipement = CAPACITE_EQUIPEMENT_J120.get(stem, [2, 1, 2])
-        besoin_equipement   = BESOIN_EQUIPEMENT_J120.get(stem, {})
-    else:
-        debut_ete           = DEBUT_ETE_J30
-        fin_ete             = FIN_ETE_J30
-        stock_ciment        = STOCK_CIMENT_J30.get(stem, 300)
-        ciment_par_tache    = CIMENT_PAR_TACHE_J30.get(stem, {})
-        taches_beton_0based = TACHES_BETON_J30.get(stem, [])
-        n_equipements       = N_EQUIPEMENTS_J30.get(stem, 2)
-        capacite_equipement = CAPACITE_EQUIPEMENT_J30.get(stem, [2, 1])
-        besoin_equipement   = BESOIN_EQUIPEMENT_J30.get(stem, {})
+    # Sélection des paramètres d'extension selon le type
+    if inst_type == 'J120':
+        debut_ete = DEBUT_ETE_J120
+        fin_ete = FIN_ETE_J120
+        ciment_dict = CIMENT_PAR_TACHE_J120.get(stem, {})
+        acier_dict = ACIER_PAR_TACHE_J120.get(stem, {})
+        gravier_dict = GRAVIER_PAR_TACHE_J120.get(stem, {})
+        taches_beton = TACHES_BETON_J120.get(stem, [])
+        stock_ciment = STOCK_CIMENT_J120.get(stem, 600)
+        stock_acier = STOCK_ACIER_J120.get(stem, 120)
+        stock_gravier = STOCK_GRAVIER_J120.get(stem, 1200)
+    elif inst_type == 'J90':
+        debut_ete = DEBUT_ETE_J90
+        fin_ete = FIN_ETE_J90
+        ciment_dict = CIMENT_PAR_TACHE_J90.get(stem, {})
+        acier_dict = ACIER_PAR_TACHE_J90.get(stem, {})
+        gravier_dict = GRAVIER_PAR_TACHE_J90.get(stem, {})
+        taches_beton = TACHES_BETON_J90.get(stem, [])
+        stock_ciment = STOCK_CIMENT_J90.get(stem, 450)
+        stock_acier = STOCK_ACIER_J90.get(stem, 90)
+        stock_gravier = STOCK_GRAVIER_J90.get(stem, 900)
+    elif inst_type == 'J60':
+        debut_ete = DEBUT_ETE_J60
+        fin_ete = FIN_ETE_J60
+        ciment_dict = CIMENT_PAR_TACHE_J60.get(stem, {})
+        acier_dict = ACIER_PAR_TACHE_J60.get(stem, {})
+        gravier_dict = GRAVIER_PAR_TACHE_J60.get(stem, {})
+        taches_beton = TACHES_BETON_J60.get(stem, [])
+        stock_ciment = STOCK_CIMENT_J60.get(stem, 300)
+        stock_acier = STOCK_ACIER_J60.get(stem, 60)
+        stock_gravier = STOCK_GRAVIER_J60.get(stem, 600)
+    else:  # J30
+        debut_ete = DEBUT_ETE_J30
+        fin_ete = FIN_ETE_J30
+        ciment_dict = CIMENT_PAR_TACHE_J30.get(stem, {})
+        acier_dict = ACIER_PAR_TACHE_J30.get(stem, {})
+        gravier_dict = GRAVIER_PAR_TACHE_J30.get(stem, {})
+        taches_beton = TACHES_BETON_J30.get(stem, [])
+        stock_ciment = STOCK_CIMENT_J30.get(stem, 200)
+        stock_acier = STOCK_ACIER_J30.get(stem, 40)
+        stock_gravier = STOCK_GRAVIER_J30.get(stem, 400)
 
-    # =========================================================
-    # CORRECTION v2 : convertir indices 0-based -> 1-based
-    # MiniZinc utilise des tableaux 1..n, donc tous les indices
-    # de taches doivent etre decales de +1
-    # =========================================================
-    taches_beton_1based = [t + 1 for t in taches_beton_0based if 0 <= t < n]
+    # Vecteurs RNR (1-based, toutes les tâches)
+    ciment = [ciment_dict.get(i, 0) for i in range(1, n_total + 1)]
+    acier = [acier_dict.get(i, 0) for i in range(1, n_total + 1)]
+    gravier = [gravier_dict.get(i, 0) for i in range(1, n_total + 1)]
 
-    # Vecteur ciment (0-based en interne, tableau 1-indexed en MiniZinc)
-    ciment = [0] * n
-    for idx, qty in ciment_par_tache.items():
-        if 0 <= idx < n:
-            ciment[idx] = qty
-
-    # Matrice besoin equipements (0-based -> tableau MiniZinc 1-indexed)
-    besoin_eq = [[0] * n_equipements for _ in range(n)]
-    for idx, needs in besoin_equipement.items():
-        if 0 <= idx < n:
-            for e in range(min(len(needs), n_equipements)):
-                besoin_eq[idx][e] = needs[e]
-
-    # Verification coherence : stock >= sum(ciment)
+    # Vérification cohérence
     total_ciment = sum(ciment)
-    if stock_ciment < total_ciment:
-        print(f"  [AVERT] {stem}: stock_NR={stock_ciment} < sum(ciment)={total_ciment} "
-              f"-> infaisable ! Correction automatique.")
-        stock_ciment = round(total_ciment * 1.05)
+    total_acier = sum(acier)
+    total_gravier = sum(gravier)
 
+    if stock_ciment < total_ciment:
+        stock_ciment = round(total_ciment * 1.05)
+    if stock_acier < total_acier:
+        stock_acier = round(total_acier * 1.05)
+    if stock_gravier < total_gravier:
+        stock_gravier = round(total_gravier * 1.05)
+
+    n_taches_beton = len(taches_beton)
+
+    # Construction du fichier
     lines = [
+        f"% =====================================================================",
         f"% Instance : {data['name']}",
-        f"% Generee par parser_btp.py v2 — Projet P2 RCPSP etendu INSEA",
-        f"% Type : {'J120' if is_j120 else 'J30'} (n={n} taches reelles)",
-        f"% CORRECTION v2 : H reduit de {data.get('H_original', data['H'])} -> {data['H']}",
-        f"%                 Indices taches beton/equip en 1-based (MiniZinc 1..n)",
-        f"%                 Stock ciment avec marge 5% (contrainte active)",
-        f"% Extensions : Climatique + NR + Equipements lourds + Scalabilite",
+        f"% Type : {inst_type} (n_total={n_total} tâches, dont {n_total-2} réelles)",
+        f"% Généré par parser_btp_v3.py — Projet P2 RCPSP étendu INSEA",
+        f"% Extensions : Climatique + NR (Ciment/Acier/Gravier) + Scalabilité",
+        f"% =====================================================================",
         f"",
-        f"% --- Parametres de base ---",
-        f"n     = {n};",
-        f"H     = {data['H']};",
-        f"n_res = {data['n_res']};",
+        f"% --- Paramètres de base ---",
+        f"n_total = {n_total};",
+        f"H       = {data['H']};",
         f"",
-        f"% --- Durees des taches (jours) ---",
+        f"% --- Durées des tâches (jours ouvrés) ---",
+        f"% Tâche 1 = SOURCE (dummy), Tâche {n_total} = PUITS (dummy)",
         f"duree = {format_list(data['durations'])};",
         f"",
-        f"% --- Capacites ressources renouvelables standard ---",
-        f"capacite = {format_list(data['caps'])};",
+        f"% --- Précédences (format paires PSPLIB) ---",
+        f"n_prec = {data['n_prec']};",
+        f"prec = {format_2d(data['prec_pairs'])};",
         f"",
-        f"% --- Demandes en ressources renouvelables [tache, ressource] ---",
-        f"besoin = {format_2d(data['demands'])};",
+        f"% --- Ressources renouvelables ---",
+        f"n_RR = {data['n_res']};",
+        f"capacite_RR = {format_list(data['caps'])};",
+        f"besoin_RR = {format_2d(data['demands'])};",
         f"",
-        f"% --- Matrice de precedence [i,j]=1 si i doit finir avant j ---",
-        f"prec = {format_2d(data['prec_matrix'])};",
+        f"% --- Ressources non-renouvelables ---",
+        f"% RNR1 = Ciment (tonnes), RNR2 = Acier (tonnes), RNR3 = Gravier (m³)",
+        f"n_RNR = 3;",
+        f"budget_RNR = [{stock_ciment}, {stock_acier}, {stock_gravier}];",
+        f"besoin_RNR = [| {', '.join(str(ciment[i]) for i in range(n_total))} |",
+        f"             | {', '.join(str(acier[i]) for i in range(n_total))} |",
+        f"             | {', '.join(str(gravier[i]) for i in range(n_total))} |];",
         f"",
-        f"% --- Extension A : Fenetre climatique ---",
+        f"% --- Contraintes climatiques ---",
         f"debut_ete = {debut_ete};",
         f"fin_ete   = {fin_ete};",
+        f"n_TACHES_BETON = {n_taches_beton};",
+        f"TACHES_BETON = {{{', '.join(str(t) for t in taches_beton)}}};",
         f"",
-        f"% --- Extension B : Taches beton (indices 1-based pour MiniZinc) ---",
-        f"% NOTE: {len(taches_beton_1based)} taches beton identifiees",
-        f"TACHES_BETON = {{{', '.join(str(t) for t in taches_beton_1based)}}};",
-        f"",
-        f"% --- Extension C : Ressource non-renouvelable (ciment) ---",
-        f"% NOTE: sum(ciment)={total_ciment}t, stock={stock_ciment}t (marge ~5%)",
-        f"stock_NR = {stock_ciment};",
-        f"ciment   = {format_list(ciment)};",
-        f"",
-        f"% --- Extension D : Equipements lourds partages ---",
-        f"n_equipements = {n_equipements};",
-        f"capacite_equipement = {format_list(capacite_equipement)};",
-        f"besoin_equipement = {format_2d(besoin_eq)};",
+        f"% =====================================================================",
+        f"% Vérification RNR : Ciment={total_ciment}/{stock_ciment}, Acier={total_acier}/{stock_acier}, Gravier={total_gravier}/{stock_gravier}",
+        f"% Tâches béton : {n_taches_beton} tâches identifiées",
+        f"% =====================================================================",
     ]
 
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines) + '\n')
 
-    print(f"  [OK] {out_path} ({'J120' if is_j120 else 'J30'}, {n} taches, "
-          f"H={data['H']} (etait {data.get('H_original', data['H'])}), "
-          f"beton={len(taches_beton_1based)}, equip={n_equipements})")
+    print(f"  [OK] {out_path} ({inst_type}, n_total={n_total}, H={data['H']}, "
+          f"béton={n_taches_beton}, RNR=3)")
 
 
 # ===========================================================================
-# 8. AFFICHAGE RESUME + TABLEAU SCALABILITE
+# 10. AFFICHAGE RÉSUMÉ + TABLEAU SCALABILITÉ
 # ===========================================================================
 
 def print_summary(data: dict) -> None:
-    stem    = data['stem']
-    n       = data['n']
-    is_j120 = data['is_j120']
     metrics = compute_metrics(data)
-
-    print(f"\n{'='*60}")
-    print(f"Instance : {data['name']} ({'J120' if is_j120 else 'J30'})")
-    print(f"  Cle dictionnaire   : {stem}")
-    print(f"  Taches reelles     : {n}")
-    print(f"  Horizon H          : {data['H']} (original: {data.get('H_original', data['H'])})")
-    print(f"  Ressources         : {data['n_res']}")
-    print(f"  Capacites          : {data['caps']}")
+    print(f"\n{'='*70}")
+    print(f"Instance : {data['name']} ({data['inst_type']})")
+    print(f"  Tâches totales     : {data['n_total']} (dont {metrics['n_real']} réelles)")
+    print(f"  Horizon H          : {data['H']}")
+    print(f"  Ressources RR      : {data['n_res']}")
+    print(f"  Capacités RR       : {data['caps']}")
     print(f"  RF (couverture)    : {metrics['rf']}")
     print(f"  RS (pression)      : {metrics['rs']}")
-    print(f"  NC (precedences)   : {metrics['nc']}")
+    print(f"  NC (précédences)   : {metrics['nc']}")
     print(f"  Travail total      : {metrics['total_work']} jours")
-    print(f"  Duree moyenne      : {metrics['avg_duration']} jours")
-
-    if is_j120:
-        stock      = STOCK_CIMENT_J120.get(stem, 'N/A')
-        n_beton    = len(TACHES_BETON_J120.get(stem, []))
-        n_equip    = N_EQUIPEMENTS_J120.get(stem, 0)
-        cap_equip  = CAPACITE_EQUIPEMENT_J120.get(stem, [])
-    else:
-        stock      = STOCK_CIMENT_J30.get(stem, 'N/A')
-        n_beton    = len(TACHES_BETON_J30.get(stem, []))
-        n_equip    = N_EQUIPEMENTS_J30.get(stem, 0)
-        cap_equip  = CAPACITE_EQUIPEMENT_J30.get(stem, [])
-
-    print(f"  Stock ciment       : {stock} t")
-    print(f"  Taches beton       : {n_beton}")
-    print(f"  Equipements lourds : {n_equip} types")
-    print(f"  Capacite equip.    : {cap_equip}")
+    print(f"  Durée moyenne      : {metrics['avg_duration']} jours")
 
 
 def print_scalability_table(all_data: list):
-    """Affiche le tableau comparatif de scalabilite"""
     analysis = analyze_scalability(all_data)
 
-    print(f"\n{'='*70}")
-    print("ANALYSE DE SCALABILITE")
-    print(f"{'='*70}")
+    print(f"\n{'='*80}")
+    print("ANALYSE DE SCALABILITÉ")
+    print(f"{'='*80}")
 
-    print(f"\n{'Instance':<15} {'Type':>6} {'Jobs':>6} {'Horizon':>8} "
+    print(f"\n{'Instance':<15} {'Type':>6} {'Total':>6} {'Réelles':>7} {'Horizon':>8} "
           f"{'Work':>8} {'RF':>6} {'RS':>6} {'NC':>6}")
-    print("-" * 70)
+    print("-" * 80)
     for info in analysis['instances']:
-        print(f"{info['name']:<15} {info['type']:>6} {info['n_jobs']:>6} "
+        print(f"{info['name']:<15} {info['type']:>6} {info['n_total']:>6} {info['n_real']:>7} "
               f"{info['horizon']:>8} {info['total_work']:>8} {info['rf']:>6.3f} "
               f"{info['rs']:>6.3f} {info['nc']:>6.3f}")
 
     if analysis['summary']:
-        print(f"\n{'='*70}")
-        print("RATIOS J120 / J30")
-        print(f"{'='*70}")
-        s = analysis['summary']
-        print(f"  Ratio jobs    : {s['ratio_jobs_j120_j30']:.2f}x")
-        print(f"  Ratio horizon : {s['ratio_horizon_j120_j30']:.2f}x")
-        print(f"  Ratio travail : {s['ratio_work_j120_j30']:.2f}x")
-        print(f"\n  RF moyen J30  : {s['avg_rf_j30']:.3f} | J120 : {s['avg_rf_j120']:.3f}")
-        print(f"  RS moyen J30  : {s['avg_rs_j30']:.3f} | J120 : {s['avg_rs_j120']:.3f}")
-        print(f"  NC moyen J30  : {s['avg_nc_j30']:.3f} | J120 : {s['avg_nc_j120']:.3f}")
+        print(f"\n{'='*80}")
+        print("RÉSUMÉ PAR TYPE D'INSTANCE")
+        print(f"{'='*80}")
+        for t in ['J30', 'J60', 'J90', 'J120']:
+            if t in analysis['summary']:
+                s = analysis['summary'][t]
+                print(f"\n  {t} ({s['count']} instances):")
+                print(f"    Tâches réelles moy. : {s['avg_jobs']:.1f}")
+                print(f"    Horizon moyen       : {s['avg_horizon']:.1f}")
+                print(f"    Travail total moy.  : {s['avg_work']:.1f}")
+                print(f"    RF moyen            : {s['avg_rf']:.3f}")
+                print(f"    RS moyen            : {s['avg_rs']:.3f}")
+                print(f"    NC moyen            : {s['avg_nc']:.3f}")
 
     return analysis
 
 
 # ===========================================================================
-# 9. MAIN
+# 11. MAIN
 # ===========================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Parser PSPLIB J30+J120 depuis .docx -> .dzn MiniZinc + Scalabilite"
+        description="Parser PSPLIB J30/J60/J90/J120 -> .dzn MiniZinc + Scalabilité"
     )
-    parser.add_argument("--input",      "-i", default="instancesdebtp.docx",
+    parser.add_argument("--input", "-i", default="instancesdebtp.docx",
                         help="Chemin vers le fichier source (.docx ou .txt)")
-    parser.add_argument("--outdir",     "-o", default="dzn_output",
+    parser.add_argument("--outdir", "-o", default="dzn_output",
                         help="Dossier de sortie pour les fichiers .dzn")
-    parser.add_argument("--verify",     "-v", action="store_true",
-                        help="Afficher le resume uniquement (pas de .dzn)")
-    parser.add_argument("--scalabilite","-s", action="store_true",
-                        help="Generer le rapport de scalabilite JSON")
-    parser.add_argument("--debug",      "-d", action="store_true",
-                        help="Mode debug: afficher les noms trouves")
+    parser.add_argument("--verify", "-v", action="store_true",
+                        help="Afficher le résumé uniquement (pas de .dzn)")
+    parser.add_argument("--scalabilite", "-s", action="store_true",
+                        help="Générer le rapport de scalabilité JSON")
+    parser.add_argument("--debug", "-d", action="store_true",
+                        help="Mode debug")
     args = parser.parse_args()
 
     print(f"Chargement de : {args.input}")
@@ -724,10 +759,10 @@ def main():
 
     if args.debug:
         bas_names = re.findall(r'file with basedata\s*:\s*(\S+)', raw, re.IGNORECASE)
-        print(f"\n[DEBUG] Basedata trouves ({len(bas_names)}): {bas_names}\n")
+        print(f"\n[DEBUG] Basedata trouvés ({len(bas_names)}): {bas_names}\n")
 
     all_blocks = re.split(
-        r'(?=(?:\*{5,}\s*file with basedata\s*:\s*\S+|file with basedata\s*:\s*\S+|j30\d+_\d+\.sm))',
+        r'(?=(?:\*{5,}\s*file with basedata\s*:\s*\S+|file with basedata\s*:\s*\S+|j\d+_\d+\.sm))',
         raw, flags=re.IGNORECASE
     )
 
@@ -737,30 +772,26 @@ def main():
         if not b:
             continue
         has_prec = 'PRECEDENCE' in b
-        has_req  = 'REQUESTS'   in b
-        has_res  = 'RESOURCE'   in b
+        has_req = 'REQUESTS' in b
+        has_res = 'RESOURCE' in b
         has_jobs = re.search(r'jobs.*?:\s*\d+', b) is not None
 
         if has_prec and has_req and has_res and has_jobs:
             valid_blocks.append(b)
-        elif args.debug and (has_prec or has_req):
-            preview = b[:100].replace('\n', ' ')
-            print(f"[DEBUG] Bloc rejete: {preview}...")
 
     blocks = valid_blocks
 
     if not blocks:
-        print("ERREUR : Aucun bloc valide trouve.", file=sys.stderr)
+        print("ERREUR : Aucun bloc valide trouvé.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"{len(blocks)} instance(s) detectee(s)\n")
+    print(f"{len(blocks)} instance(s) détectée(s)\n")
 
     if not args.verify:
         os.makedirs(args.outdir, exist_ok=True)
 
-    all_data  = []
-    j30_count = 0
-    j120_count= 0
+    all_data = []
+    counts = {'J30': 0, 'J60': 0, 'J90': 0, 'J120': 0}
 
     for block in blocks:
         try:
@@ -772,19 +803,12 @@ def main():
             if not args.verify:
                 dzn_path = os.path.join(args.outdir, f"{data['stem']}.dzn")
                 to_dzn(data, dzn_path)
-
-                if data['is_j120']:
-                    j120_count += 1
-                else:
-                    j30_count  += 1
+                counts[data['inst_type']] = counts.get(data['inst_type'], 0) + 1
 
         except Exception as e:
             print(f"ERREUR lors du parsing : {e}", file=sys.stderr)
-            if args.debug:
-                preview = block[:200].replace('\n', ' ')
-                print(f"  [DEBUG] Debut du bloc: {preview}...", file=sys.stderr)
 
-    # Analyse de scalabilite
+    # Analyse de scalabilité
     if len(all_data) > 1:
         analysis = print_scalability_table(all_data)
 
@@ -792,14 +816,15 @@ def main():
             scal_file = os.path.join(args.outdir, 'scalabilite_analysis.json')
             with open(scal_file, 'w', encoding='utf-8') as f:
                 json.dump(analysis, f, indent=2, ensure_ascii=False)
-            print(f"\n[OK] Rapport de scalabilite: {scal_file}")
+            print(f"\n[OK] Rapport de scalabilité : {scal_file}")
 
     if not args.verify:
         print(f"\n{'='*60}")
-        print(f"Fichiers .dzn ecrits dans : {args.outdir}/")
-        print(f"  J30 : {j30_count} instances")
-        print(f"  J120: {j120_count} instances")
-        print(f"  Total: {j30_count + j120_count} instances")
+        print(f"Fichiers .dzn écrits dans : {args.outdir}/")
+        for t in ['J30', 'J60', 'J90', 'J120']:
+            if counts.get(t, 0) > 0:
+                print(f"  {t} : {counts[t]} instances")
+        print(f"  Total : {sum(counts.values())} instances")
 
 
 if __name__ == "__main__":
