@@ -1,0 +1,42 @@
+% Instance : casa-lyc-14.sm
+% Generee par parser_btp.py v2 — Projet P2 RCPSP etendu INSEA
+% Type : J30 (n=14 taches reelles)
+% CORRECTION v2 : H reduit de 280 -> 235
+%                 Indices taches beton/equip en 1-based (MiniZinc 1..n)
+%                 Stock ciment avec marge 5% (contrainte active)
+% Extensions : Climatique + NR + Equipements lourds + Scalabilite
+
+% --- Parametres de base ---
+n     = 14;
+H     = 235;
+n_res = 3;
+
+% --- Durees des taches (jours) ---
+duree = [8, 14, 18, 10, 16, 12, 16, 12, 20, 25, 12, 20, 30, 22];
+
+% --- Capacites ressources renouvelables standard ---
+capacite = [8, 2, 3];
+
+% --- Demandes en ressources renouvelables [tache, ressource] ---
+besoin = [| 2, 1, 1 | 3, 2, 1 | 5, 2, 1 | 4, 1, 1 | 5, 1, 1 | 6, 2, 1 | 5, 1, 1 | 6, 2, 1 | 7, 2, 2 | 6, 0, 2 | 3, 1, 1 | 4, 0, 1 | 5, 0, 2 | 6, 0, 2 |];
+
+% --- Matrice de precedence [i,j]=1 si i doit finir avant j ---
+prec = [| 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 | 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 | 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 | 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0 | 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 | 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0 | 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 | 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0 | 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0 | 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0 | 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0 | 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 | 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 | 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 |];
+
+% --- Extension A : Fenetre climatique ---
+debut_ete = 80;
+fin_ete   = 140;
+
+% --- Extension B : Taches beton (indices 1-based pour MiniZinc) ---
+% NOTE: 0 taches beton identifiees
+TACHES_BETON = {};
+
+% --- Extension C : Ressource non-renouvelable (ciment) ---
+% NOTE: sum(ciment)=0t, stock=300t (marge ~5%)
+stock_NR = 300;
+ciment   = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+% --- Extension D : Equipements lourds partages ---
+n_equipements = 2;
+capacite_equipement = [2, 1];
+besoin_equipement = [| 0, 0 | 0, 0 | 0, 0 | 0, 0 | 0, 0 | 0, 0 | 0, 0 | 0, 0 | 0, 0 | 0, 0 | 0, 0 | 0, 0 | 0, 0 | 0, 0 |];
