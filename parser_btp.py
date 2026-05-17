@@ -1,485 +1,469 @@
-#!/usr/bin/env python3
 """
-Parser PSPLIB Unifié — J30 + CASA-LYC-14
-==========================================
-Génère deux types de fichiers .dzn :
-  - Type STANDARD  : pour les instances J30 (PSPLIB classique)
-  - Type BTP-ENRICH: pour l'instance CASA-LYC-14 (ressources non-renouvelables,
-                     contraintes climatiques, tâches béton)
+parser_btp.py
+=============
+Lit instancesdebtp.docx et génère un fichier .dzn MiniZinc par instance.
 
-Usage:
-    python3 parser_unified.py --input instancesdebtp.docx --outdir dzn_output
+Projet P2 — CP-INSEA-SDRO-2A — RCPSP étendu BTP marocain
+Encadrant : Dr. Jabrane SLIMANI
+
+Usage :
+    python parser_btp.py                                    # tout générer
+    python parser_btp.py --docx chemin/instancesdebtp.docx # docx custom
+    python parser_btp.py --out mon_dossier/                 # dossier de sortie
+    python parser_btp.py --list                             # lister les instances
+    python parser_btp.py --instance CASA-LYC-14            # une seule instance
 """
 
 import re
-import os
 import sys
 import argparse
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List, Optional
 
-# ===========================================================================
-# 1. MAPPING NOMS
-# ===========================================================================
-
-NAME_MAPPING = {
-    "j30_17":  "j301_1",  "j30_37":  "j3021_1", "j30_45":  "j3029_1",
-    "j30_61":  "j3045_1", "j30_82":  "j3082_1",
-    "j60_1":   "j601_1",  "j60_2":   "j601_2",  "j60_3":   "j601_3",
-    "j60_4":   "j601_4",  "j60_17":  "j601_1",
-    "j90_1":   "j901_1",  "j90_2":   "j901_2",  "j90_3":   "j901_3",
-    "j90_4":   "j901_4",  "j901_":   "j901_1",
-    "j1201_1": "j1201_1", "j1201_2": "j1201_2",
-    "j1201_3": "j1201_3", "j1201_4": "j1201_4",
-}
-
-def get_instance_key(basedata_name: str) -> str:
-    clean = basedata_name.lower().replace('.bas', '').replace('.sm', '').strip()
-    return NAME_MAPPING.get(clean, clean)
-
-def get_instance_type(stem: str) -> str:
-    s = stem.lower()
-    if 'casa' in s or 'lyc' in s:  return 'BTP-ENRICH'
-    if s.startswith('j120'):        return 'J120'
-    if s.startswith('j90'):         return 'J90'
-    if s.startswith('j60'):         return 'J60'
-    if s.startswith('j30'):         return 'J30'
-    return 'UNKNOWN'
+try:
+    import docx
+except ImportError:
+    sys.exit("❌  Installe python-docx :  pip install python-docx")
 
 
-# ===========================================================================
-# 2. EXTRACTION TEXTE
-# ===========================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# Structures
+# ══════════════════════════════════════════════════════════════════════════════
 
-def load_raw_text(path: str) -> str:
-    if path.endswith(".docx"):
-        try:
-            import docx as _docx
-        except ImportError:
-            raise RuntimeError("Installez python-docx : pip3 install python-docx")
-        doc = _docx.Document(path)
-        lines = []
-        for table in doc.tables:
-            for row in table.rows:
-                lines.append("\t".join(cell.text for cell in row.cells))
-        for para in doc.paragraphs:
-            lines.append(para.text)
-        text = "\n".join(lines)
-    else:
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
-    return re.sub(r'\n{3,}', '\n\n', text)
-
-
-# ===========================================================================
-# 3. PARSING COMMUN (précédences + durées/demandes renouvelables + caps)
-# ===========================================================================
-
-def parse_precedences(content: str) -> dict:
-    """Retourne {job: [successeurs]} depuis la section PRECEDENCE RELATIONS."""
-    prec_match = re.search(
-        r'PRECEDENCE\s*RELATIONS\s*[:=?]?\s*(.*?)\s*REQUESTS',
-        content, re.DOTALL | re.IGNORECASE
-    )
-    successors = {}
-    if not prec_match:
-        return successors
-    for line in prec_match.group(1).splitlines():
-        line = line.strip()
-        if not line or re.match(r'(jobnr|job|pronr)', line, re.IGNORECASE):
-            continue
-        parts = line.split()
-        if len(parts) >= 3:
-            try:
-                job    = int(parts[0])
-                n_succ = int(parts[2])
-                succs  = [int(x) for x in parts[3:3 + n_succ]]
-                successors[job] = succs
-            except (ValueError, IndexError):
-                continue
-    return successors
+@dataclass
+class Instance:
+    name: str
+    n_jobs: int = 0
+    horizon: int = 0
+    n_RR: int = 0
+    n_NR: int = 0
+    durations:   List[int]       = field(default_factory=list)
+    demand_RR:   List[List[int]] = field(default_factory=list)
+    cap_RR:      List[int]       = field(default_factory=list)
+    demand_NR:   List[List[int]] = field(default_factory=list)
+    budget_NR:   List[int]       = field(default_factory=list)
+    predecessors: List[List[int]] = field(default_factory=list)  # 1-based
+    # Extensions climatiques
+    summer_start:   int       = 108
+    summer_end:     int       = 192
+    concrete_tasks: List[int] = field(default_factory=list)      # 1-based
 
 
-def parse_renewable_requests(content: str, n_res: int) -> tuple:
+# ══════════════════════════════════════════════════════════════════════════════
+# Lecture du .docx → texte brut
+# ══════════════════════════════════════════════════════════════════════════════
+
+def read_docx(path: str) -> str:
+    """Extrait tout le texte du .docx en un seul bloc."""
+    doc = docx.Document(path)
+    return "\n".join(p.text for p in doc.paragraphs)
+
+
+def split_into_blocks(text: str) -> List[tuple]:
     """
-    Retourne (durations_raw, demands_raw) depuis REQUESTS/DURATIONS (RENEWABLE).
-    Gère indifféremment :
-      - "REQUESTS/DURATIONS :"
-      - "REQUESTS/DURATIONS (RENEWABLE RESOURCES) :"
+    Découpe le texte en blocs (nom, contenu) en cherchant
+    'file with basedata' comme marqueur de début d'instance.
     """
-    # Cherche la section RENEWABLE uniquement (s'arrête avant NONRENEWABLE)
-    req_match = re.search(
-        r'REQUESTS/DURATIONS(?:\s*\([^)]*RENEWABLE\s*RESOURCES[^)]*\))?\s*[:=?]?\s*\n'
-        r'(.*?)'
-        r'\s*(?:REQUESTS/DURATIONS\s*\(NONRENEWABLE|RESOURCEAVAIL|RESOURCE\s*AVAIL)',
-        content, re.DOTALL | re.IGNORECASE
-    )
-    if not req_match:
-        # Fallback sans parenthèse
-        req_match = re.search(
-            r'REQUESTS/DURATIONS[^\n]*\n(.*?)'
-            r'\s*(?:RESOURCE\s*AVAIL|RESOURCEAVAIL)',
-            content, re.DOTALL | re.IGNORECASE
-        )
+    # Positions de chaque 'file with basedata'
+    markers = [m.start() for m in re.finditer(r'file with basedata', text, re.IGNORECASE)]
+    if not markers:
+        return []
 
-    durations_raw, demands_raw = {}, {}
-    if not req_match:
-        return durations_raw, demands_raw
+    blocks = []
+    for i, start in enumerate(markers):
+        end = markers[i + 1] if i + 1 < len(markers) else len(text)
+        chunk = text[start:end]
 
-    for line in req_match.group(1).splitlines():
-        line = line.strip()
-        if not line or re.match(r'(jobnr|job|-)', line, re.IGNORECASE):
-            continue
-        parts = line.split()
-        if len(parts) >= 3 + n_res:
-            try:
-                job      = int(parts[0])
-                duration = int(parts[2])
-                demands  = [int(parts[3 + r]) for r in range(n_res)]
-                durations_raw[job] = duration
-                demands_raw[job]   = demands
-            except (ValueError, IndexError):
-                continue
-    return durations_raw, demands_raw
+        # Extraire le nom : ce qui suit ':'
+        m = re.search(r'file with basedata\s*:\s*(.+)', chunk, re.IGNORECASE)
+        raw_name = m.group(1).strip() if m else f"instance_{i+1}"
+        # Nettoyer le nom pour en faire un nom de fichier
+        name = re.sub(r'[^\w\-]', '_', raw_name.split()[0]).strip('_')
+        blocks.append((name, chunk))
+
+    return blocks
 
 
-def parse_renewable_caps(content: str, n_res: int) -> list:
-    """
-    Retourne les capacités renouvelables.
-    Gère "RESOURCE AVAILABILITIES" et "RESOURCEAVAILABILITIES (RENEWABLE)".
-    """
-    cap_match = re.search(
-        r'RESOURCE\s*AVAILABILITIES(?:\s*\([^)]*RENEWABLE[^)]*\))?\s*[:=?]?\s*\n'
-        r'(.*?)'
-        r'(?:RESOURCE\s*AVAIL.*?NONRENEWABLE|CLIMATIC|\*{5}|\Z)',
-        content, re.DOTALL | re.IGNORECASE
-    )
-    if not cap_match:
-        return [10] * n_res
+# ══════════════════════════════════════════════════════════════════════════════
+# Parser générique PSPLIB (blocs standard)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    for line in cap_match.group(1).splitlines():
-        line = line.strip()
-        if not line or re.match(r'^[RN*]', line):
-            continue
-        parts = line.split()
-        if len(parts) >= n_res:
-            try:
-                return [int(parts[r]) for r in range(n_res)]
-            except ValueError:
-                continue
-    return [10] * n_res
+def _int(s: str) -> int:
+    return int(s.strip())
 
 
-# ===========================================================================
-# 4. PARSING SPÉCIFIQUE CASA-LYC-14 (ressources non-renouvelables + extras)
-# ===========================================================================
+def parse_header(text: str, inst: Instance):
+    m = re.search(r'jobs\s*\(incl\.\s*supersource/sink\s*\)\s*:\s*(\d+)', text)
+    if m: inst.n_jobs = _int(m.group(1))
 
-def parse_nonrenewable_requests(content: str, n_nr: int) -> dict:
-    """Retourne {job: [demandes_NR]} depuis REQUESTS/DURATIONS (NONRENEWABLE RESOURCES)."""
-    nr_match = re.search(
-        r'REQUESTS/DURATIONS\s*\([^)]*NONRENEWABLE[^)]*\)[^\n]*\n(.*?)'
-        r'\s*(?:RESOURCEAVAIL|RESOURCE\s*AVAIL)',
-        content, re.DOTALL | re.IGNORECASE
-    )
-    nr_demands = {}
-    if not nr_match:
-        return nr_demands
-    for line in nr_match.group(1).splitlines():
-        line = line.strip()
-        if not line or re.match(r'(jobnr|job|-)', line, re.IGNORECASE):
-            continue
-        parts = line.split()
-        if len(parts) >= 3 + n_nr:
-            try:
-                job = int(parts[0])
-                nr_demands[job] = [int(parts[3 + r]) for r in range(n_nr)]
-            except (ValueError, IndexError):
-                continue
-    return nr_demands
+    m = re.search(r'horizon\s*:\s*(\d+)', text)
+    if m: inst.horizon = _int(m.group(1))
+
+    m = re.search(r'renewable\s*:\s*(\d+)\s*R', text)
+    if m: inst.n_RR = _int(m.group(1))
+
+    m = re.search(r'nonrenewable\s*:\s*(\d+)\s*N', text)
+    if m: inst.n_NR = _int(m.group(1))
 
 
-def parse_nonrenewable_caps(content: str, n_nr: int) -> list:
-    """Retourne les capacités non-renouvelables."""
-    cap_match = re.search(
-        r'RESOURCE\s*AVAILABILITIES\s*\([^)]*NONRENEWABLE[^)]*\)\s*[:=?]?\s*\n(.*?)'
-        r'(?:CLIMATIC|\*{5}|\Z)',
-        content, re.DOTALL | re.IGNORECASE
-    )
-    if not cap_match:
-        return [9999] * n_nr
-    for line in cap_match.group(1).splitlines():
-        line = line.strip()
-        if not line or re.match(r'^[RN*]', line):
-            continue
-        parts = line.split()
-        if len(parts) >= n_nr:
-            try:
-                return [int(parts[r]) for r in range(n_nr)]
-            except ValueError:
-                continue
-    return [9999] * n_nr
+def parse_precedence(text: str, inst: Instance):
+    """Construit predecessors[i] depuis la section PRECEDENCE RELATIONS."""
+    sec = re.search(r'PRECEDENCE RELATIONS(.*?)(?=REQUESTS|$)', text, re.DOTALL | re.IGNORECASE)
+    if not sec:
+        return
+
+    # successors[job] = [s1, s2, ...]  (1-based)
+    successors: dict = {}
+    for line in sec.group(1).split('\n'):
+        m = re.match(r'\s*(\d+)\s+\d+\s+(\d+)(.*)', line)
+        if m:
+            job    = int(m.group(1))
+            n_succ = int(m.group(2))
+            rest   = m.group(3).strip().split()
+            successors[job] = [int(x) for x in rest[:n_succ]]
+
+    # Inverser → predecessors
+    preds = {i: [] for i in range(1, inst.n_jobs + 1)}
+    for j, succs in successors.items():
+        for s in succs:
+            if 1 <= s <= inst.n_jobs:
+                preds[s].append(j)
+    inst.predecessors = [preds.get(i, []) for i in range(1, inst.n_jobs + 1)]
 
 
-def parse_climatic(content: str) -> dict:
-    """Extrait les contraintes climatiques CASA-LYC-14."""
-    result = {}
-    m = re.search(r'Big-M\s*[^:]*:\s*(\d+)', content, re.IGNORECASE)
-    result['big_m'] = int(m.group(1)) if m else 280
-
-    m = re.search(r'Summer window start[^:]*:\s*(\d+)', content, re.IGNORECASE)
-    result['summer_start'] = int(m.group(1)) if m else 108
-
-    m = re.search(r'Summer window end[^:]*:\s*(\d+)', content, re.IGNORECASE)
-    result['summer_end'] = int(m.group(1)) if m else 192
-
-    m = re.search(r'Working days only\s*:\s*(YES|NO)', content, re.IGNORECASE)
-    result['working_days_only'] = (m.group(1).upper() == 'YES') if m else True
-
-    return result
+def _parse_job_lines(section_text: str, n_jobs: int, n_res: int):
+    """Parse les lignes 'jobnr mode duration r1 r2 ...' et retourne (durations, demands)."""
+    durations = [0] * n_jobs
+    demands   = [[0] * n_res for _ in range(n_jobs)]
+    for line in section_text.split('\n'):
+        m = re.match(r'\s*(\d+)\s+1\s+(\d+)(.*)', line)
+        if m:
+            job = int(m.group(1)) - 1          # 0-based
+            dur = int(m.group(2))
+            vals = list(map(int, m.group(3).strip().split()))
+            if 0 <= job < n_jobs:
+                durations[job] = dur
+                demands[job]   = (vals[:n_res] + [0] * n_res)[:n_res]
+    return durations, demands
 
 
-def parse_concrete_tasks(content: str) -> list:
-    """Extrait le sous-ensemble de tâches béton."""
-    m = re.search(r'Task subset\s*:\s*\{([^}]+)\}', content, re.IGNORECASE)
+def parse_requests_standard(text: str, inst: Instance):
+    """Parse REQUESTS/DURATIONS (format PSPLIB standard, pas de sous-sections RR/NR)."""
+    sec = re.search(
+        r'REQUESTS/DURATIONS[^(].*?(?=RESOURCE\s*AVAIL|$)',
+        text, re.DOTALL | re.IGNORECASE)
+    if not sec:
+        return
+    inst.durations, inst.demand_RR = _parse_job_lines(sec.group(0), inst.n_jobs, inst.n_RR)
+
+
+def parse_requests_extended(text: str, inst: Instance):
+    """Parse REQUESTS/DURATIONS (RENEWABLE) et (NONRENEWABLE) pour CASA-LYC-14."""
+    # ── Renouvelables ──
+    sec_rr = re.search(
+        r'REQUESTS/DURATIONS\s*\(RENEWABLE[^)]*\)(.*?)REQUESTS/DURATIONS\s*\(NONRENEWABLE',
+        text, re.DOTALL | re.IGNORECASE)
+    if sec_rr:
+        inst.durations, inst.demand_RR = _parse_job_lines(
+            sec_rr.group(1), inst.n_jobs, inst.n_RR)
+
+    # ── Non-renouvelables ──
+    sec_nr = re.search(
+        r'REQUESTS/DURATIONS\s*\(NONRENEWABLE[^)]*\)(.*?)RESOURCE\s*AVAIL',
+        text, re.DOTALL | re.IGNORECASE)
+    if sec_nr:
+        _, inst.demand_NR = _parse_job_lines(
+            sec_nr.group(1), inst.n_jobs, inst.n_NR)
+
+
+def parse_availabilities_standard(text: str, inst: Instance):
+    """Capacités RR pour instances PSPLIB standard."""
+    sec = re.search(r'RESOURCE\s*AVAIL.*?(?=\*{3,}|$)', text, re.DOTALL | re.IGNORECASE)
+    if not sec:
+        return
+    lines = [l.strip() for l in sec.group(0).split('\n') if l.strip()]
+    # La dernière ligne numérique contient les valeurs
+    for line in reversed(lines):
+        nums = re.findall(r'\d+', line)
+        if len(nums) >= inst.n_RR:
+            inst.cap_RR = list(map(int, nums[:inst.n_RR]))
+            break
+
+
+def parse_availabilities_extended(text: str, inst: Instance):
+    """Capacités RR et budgets NR pour CASA-LYC-14."""
+    # ── RR : chercher la ligne de valeurs après 'R 1 R 2 ...' ──
+    sec_rr = re.search(
+        r'RESOURCE\s*AVAIL.*?\(RENEWABLE\)[^\n]*\n'   # titre
+        r'[^\n]*R\s*1[^\n]*\n'                        # en-tête colonnes
+        r'[ \t]*([\d][\d\s]*)',                        # valeurs
+        text, re.IGNORECASE)
+    if sec_rr:
+        nums = list(map(int, sec_rr.group(1).strip().split()))
+        inst.cap_RR = nums[:inst.n_RR]
+
+    # ── NR ──
+    sec_nr = re.search(
+        r'RESOURCE\s*AVAIL.*?\(NONRENEWABLE\)[^\n]*\n'
+        r'[^\n]*N\s*1[^\n]*\n'
+        r'[ \t]*([\d][\d\s]*)',
+        text, re.IGNORECASE)
+    if sec_nr:
+        nums = list(map(int, sec_nr.group(1).strip().split()))
+        inst.budget_NR = nums[:inst.n_NR]
+
+
+def parse_climatic(text: str, inst: Instance):
+    """Extrait les contraintes climatiques de CASA-LYC-14."""
+    m = re.search(r'Summer window start[^:]*:\s*(\d+)', text, re.IGNORECASE)
+    if m: inst.summer_start = int(m.group(1))
+
+    m = re.search(r'Summer window end[^:]*:\s*(\d+)', text, re.IGNORECASE)
+    if m: inst.summer_end = int(m.group(1))
+
+    m = re.search(r'Task subset\s*:\s*\{([^}]+)\}', text, re.IGNORECASE)
     if m:
-        try:
-            return [int(x.strip()) for x in m.group(1).split(',')]
-        except ValueError:
-            pass
-    return []
+        inst.concrete_tasks = [int(x) for x in re.findall(r'\d+', m.group(1))]
 
 
-# ===========================================================================
-# 5. PARSEUR PRINCIPAL DE BLOC
-# ===========================================================================
+def is_moroccan(text: str) -> bool:
+    """Détecte si le bloc est l'instance marocaine étendue."""
+    return bool(re.search(r'CASA-LYC|RENEWABLE RESOURCES|NONRENEWABLE RESOURCES|CLIMATIC', 
+                           text, re.IGNORECASE))
 
-def parse_block(content: str) -> dict:
-    # --- Nom & type ---
-    bas_match = re.search(r'file with basedata\s*:\s*([^\n]+)', content, re.IGNORECASE)
-    if bas_match:
-        raw_name = bas_match.group(1).strip()
-        stem_raw = re.sub(r'\.(bas|sm)$', '', raw_name.split()[0], flags=re.IGNORECASE)
-        stem     = stem_raw.lower()
-        key      = get_instance_key(stem) if get_instance_key(stem) != stem else stem_raw
-        inst_type = get_instance_type(stem_raw)
-        name = key + ".sm"
+
+def parse_block(name: str, text: str) -> Optional[Instance]:
+    """Parse un bloc complet et retourne une Instance."""
+    inst = Instance(name=name)
+    try:
+        parse_header(text, inst)
+        parse_precedence(text, inst)
+
+        if is_moroccan(text):
+            parse_requests_extended(text, inst)
+            parse_availabilities_extended(text, inst)
+            parse_climatic(text, inst)
+        else:
+            parse_requests_standard(text, inst)
+            parse_availabilities_standard(text, inst)
+            # Tâches béton heuristiques : durée ≥ 5, hors source/sink
+            inst.concrete_tasks = [
+                i + 1 for i in range(1, inst.n_jobs - 1)
+                if inst.durations[i] >= 5
+            ][:5]
+
+        # Valider les dimensions minimales
+        assert len(inst.durations) == inst.n_jobs,  "durations mismatch"
+        assert len(inst.demand_RR) == inst.n_jobs,  "demand_RR mismatch"
+        assert len(inst.cap_RR)    == inst.n_RR,    f"cap_RR mismatch ({len(inst.cap_RR)} vs {inst.n_RR})"
+
+    except Exception as e:
+        print(f"  ⚠  [{name}] erreur parsing : {e}")
+        return None
+
+    return inst
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Générateur .dzn
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fmt_array(lst: List[int]) -> str:
+    return "[" + ", ".join(map(str, lst)) + "]"
+
+
+def fmt_matrix(mat: List[List[int]]) -> str:
+    rows = [
+        "  " + ", ".join(map(str, row)) + " |"
+        for row in mat[:-1]
+    ]
+
+    last = "  " + ", ".join(map(str, mat[-1]))
+
+    return "[|\n" + "\n".join(rows) + "\n" + last + "\n|]"
+
+
+def fmt_prec(predecessors: List[List[int]], n: int) -> str:
+    mat = [[False] * n for _ in range(n)]
+
+    for j in range(n):
+        for p in predecessors[j]:
+            i = p - 1
+            if 0 <= i < n:
+                mat[i][j] = True
+
+    rows = [
+        "  " + ", ".join(
+            "true" if v else "false"
+            for v in row
+        ) + " |"
+        for row in mat[:-1]
+    ]
+
+    last = "  " + ", ".join(
+        "true" if v else "false"
+        for v in mat[-1]
+    )
+
+    return "[|\n" + "\n".join(rows) + "\n" + last + "\n|]"
+
+
+def to_dzn(inst: Instance) -> str:
+    n  = inst.n_jobs
+    nr = inst.n_RR
+    nn = inst.n_NR
+    moroccan = nn > 0 or bool(inst.concrete_tasks and inst.summer_start != 0)
+
+    lines = []
+    lines.append(f"""\
+%% ================================================================
+%% Instance   : {inst.name}
+%% Généré par : parser_btp.py  —  Projet P2 CP-INSEA-SDRO-2A
+%% RCPSP étendu  RR={nr}  NR={nn}  Climatique={'oui' if moroccan else 'non (heuristique)'}
+%% ================================================================
+""")
+
+    # ── Dimensions ──────────────────────────────────────────────
+    lines.append(f"n    = {n};")
+    lines.append(f"H    = {inst.horizon};")
+    lines.append(f"n_RR = {nr};")
+    lines.append(f"n_NR = {nn};")
+    lines.append("")
+
+    # ── Durées ──────────────────────────────────────────────────
+    lines.append("% Durées des tâches (jours ouvrés)")
+    lines.append(f"duree = {fmt_array(inst.durations)};")
+    lines.append("")
+
+    # ── Ressources renouvelables ─────────────────────────────────
+    lines.append(f"% Capacités RR [R1..R{nr}]")
+    lines.append(f"capacite_RR = {fmt_array(inst.cap_RR)};")
+    lines.append("")
+    lines.append(f"% Besoins RR  [tâche 1..{n}] × [ressource 1..{nr}]")
+    lines.append(f"besoin_RR = {fmt_matrix(inst.demand_RR)};")
+    lines.append("")
+
+    # ── Ressources non-renouvelables ─────────────────────────────
+    if nn > 0:
+        budget = inst.budget_NR if inst.budget_NR else [0] * nn
+        dnr    = inst.demand_NR if inst.demand_NR else [[0]*nn for _ in range(n)]
+        lines.append(f"% Budgets NR [N1..N{nn}]  (matériaux consommés définitivement)")
+        lines.append(f"budget_NR = {fmt_array(budget)};")
+        lines.append("")
+        lines.append(f"% Consommations NR  [tâche 1..{n}] × [ressource 1..{nn}]")
+        lines.append(f"besoin_NR = {fmt_matrix(dnr)};")
     else:
-        raise ValueError("Impossible de trouver le nom de l'instance.")
+        lines.append("% Pas de ressources non-renouvelables pour cette instance")
+        lines.append("budget_NR = [];")
+        lines.append("besoin_NR = [||];")
+    lines.append("")
 
-    # --- Paramètres de base ---
-    n_jobs = int(re.search(r'[Jj]obs.*?[:=]\s*(\d+)', content).group(1)) if \
-             re.search(r'[Jj]obs.*?[:=]\s*(\d+)', content) else 32
+    # ── Contraintes climatiques ──────────────────────────────────
+    lines.append("% Fenêtre estivale — coulée béton interdite")
+    lines.append(f"debut_ete = {inst.summer_start};   % ≈ 1er juin (jour ouvré)")
+    lines.append(f"fin_ete   = {inst.summer_end};   % ≈ 30 sept  (jour ouvré)")
+    lines.append("")
+    lines.append("% Tâches béton soumises à la contrainte climatique")
+    lines.append(f"n_beton      = {len(inst.concrete_tasks)};")
+    lines.append(f"taches_beton = {fmt_array(inst.concrete_tasks)};")
+    lines.append("")
 
-    n_r_match = re.search(r'[Rr]enewable\s*[:=]\s*(\d+)', content)
-    n_res = int(n_r_match.group(1)) if n_r_match else 4
+    # ── Précédences ──────────────────────────────────────────────
+    lines.append("% Matrice de précédence  prec[i,j] = true  ⟺  i doit finir avant j")
+    lines.append(f"prec = {fmt_prec(inst.predecessors, n)};")
+    lines.append("")
 
-    n_nr_match = re.search(r'[Nn]onrenewable\s*[:=]\s*(\d+)', content)
-    n_nr = int(n_nr_match.group(1)) if n_nr_match else 0
+    lines.append("% Nombre de prédécesseurs par tâche (format alternatif)")
+    n_pred = [len(inst.predecessors[i]) for i in range(n)]
+    lines.append(f"n_pred = {fmt_array(n_pred)};")
+    lines.append("")
 
-    H_match = re.search(r'[Hh]orizon\s*[:=]\s*(\d+)', content)
-    H = int(H_match.group(1)) if H_match else (800 if inst_type == 'J120' else 400)
-
-    # --- Précédences ---
-    successors_raw = parse_precedences(content)
-    prec_pairs = [[j, s] for j, succs in successors_raw.items() for s in succs]
-
-    # --- Durées & demandes renouvelables ---
-    durations_raw, demands_raw = parse_renewable_requests(content, n_res)
-    caps = parse_renewable_caps(content, n_res)
-
-    n = n_jobs
-    durations = [durations_raw.get(j, 0) for j in range(1, n + 1)]
-    demands   = [demands_raw.get(j, [0] * n_res) for j in range(1, n + 1)]
-
-    result = {
-        'name':       name,
-        'stem':       key,
-        'inst_type':  inst_type,
-        'n_total':    n,
-        'H':          H,
-        'n_res':      n_res,
-        'n_nr':       n_nr,
-        'caps':       caps,
-        'durations':  durations,
-        'demands':    demands,
-        'prec_pairs': prec_pairs,
-        'n_prec':     len(prec_pairs),
-    }
-
-    # --- Données enrichies CASA-LYC-14 ---
-    if inst_type == 'BTP-ENRICH' and n_nr > 0:
-        nr_demands_raw  = parse_nonrenewable_requests(content, n_nr)
-        nr_caps         = parse_nonrenewable_caps(content, n_nr)
-        nr_demands      = [nr_demands_raw.get(j, [0] * n_nr) for j in range(1, n + 1)]
-        climatic        = parse_climatic(content)
-        concrete_tasks  = parse_concrete_tasks(content)
-
-        result.update({
-            'nr_caps':       nr_caps,
-            'nr_demands':    nr_demands,
-            'climatic':      climatic,
-            'concrete_tasks': concrete_tasks,
-        })
-
-    return result
+    return "\n".join(lines)
 
 
-# ===========================================================================
-# 6. GÉNÉRATION DZN STANDARD (J30 / J60 / J90 / J120)
-# ===========================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# Orchestrateur
+# ══════════════════════════════════════════════════════════════════════════════
 
-def to_dzn_standard(data: dict, out_path: str) -> None:
-    n, n_res, H = data['n_total'], data['n_res'], data['H']
-    flat_demands = [d for row in data['demands'] for d in row]
-    prec_flat = [
-        1 if any(p[0] == i and p[1] == j for p in data['prec_pairs']) else 0
-        for i in range(1, n + 1) for j in range(1, n + 1)
-    ]
+def run(docx_path: str, out_dir: str, only: Optional[str] = None):
+    print(f"📄  Lecture de  {docx_path} …")
+    text   = read_docx(docx_path)
+    blocks = split_into_blocks(text)
 
-    lines = [
-        f"% Instance PSPLIB standard : {data['name']}",
-        f"% Type : {data['inst_type']} ({n} tâches dont {n-2} réelles)",
-        f"% Modèle associé : model_standard.mzn",
-        f"",
-        f"n            = {n};",
-        f"n_resources  = {n_res};",
-        f"horizon      = {H};",
-        f"",
-        f"duration     = {data['durations']};",
-        f"resource_avail = {data['caps']};",
-        f"",
-        f"req = array2d(1..n, 1..n_resources, [",
-        f"    " + ", ".join(str(x) for x in flat_demands),
-        f"]);",
-        f"",
-        f"precedence = array2d(1..n, 1..n, [",
-        f"    " + ", ".join(str(x) for x in prec_flat),
-        f"]);",
-        f"",
-        f"n_prec = {data['n_prec']};",
-        f"",
-        f"% === FIN ===",
-    ]
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
-    print(f"  [STANDARD] {out_path}  (n={n}, H={H}, prec={data['n_prec']})")
+    if not blocks:
+        sys.exit("❌  Aucun bloc 'file with basedata' trouvé dans le document.")
 
+    print(f"   {len(blocks)} instance(s) détectée(s)\n")
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-# ===========================================================================
-# 7. GÉNÉRATION DZN ENRICHI (CASA-LYC-14)
-# ===========================================================================
+    results = []
+    for name, chunk in blocks:
+        if only and name.lower() != only.lower():
+            continue
+        print(f"→  {name}")
+        inst = parse_block(name, chunk)
+        if inst is None:
+            continue
+        dzn  = to_dzn(inst)
+        path = Path(out_dir) / f"{name}.dzn"
+        path.write_text(dzn, encoding="utf-8")
+        print(f"   ✓  {path}   ({inst.n_jobs} tâches, H={inst.horizon}, "
+              f"RR={inst.n_RR}, NR={inst.n_NR}, béton={len(inst.concrete_tasks)})")
+        results.append(inst)
 
-def to_dzn_btp_enrich(data: dict, out_path: str) -> None:
-    n, n_res, n_nr, H = data['n_total'], data['n_res'], data['n_nr'], data['H']
-    cl  = data['climatic']
-    ct  = data['concrete_tasks']
-
-    flat_r  = [d for row in data['demands']    for d in row]
-    flat_nr = [d for row in data['nr_demands'] for d in row]
-    prec_flat = [
-        1 if any(p[0] == i and p[1] == j for p in data['prec_pairs']) else 0
-        for i in range(1, n + 1) for j in range(1, n + 1)
-    ]
-
-    # Masque binaire béton
-    is_concrete = [1 if j in ct else 0 for j in range(1, n + 1)]
-
-    lines = [
-        f"% Instance BTP enrichie : {data['name']}",
-        f"% Type : {data['inst_type']} ({n} tâches dont {n-2} réelles)",
-        f"% Modèle associé : model_btp_enrich.mzn",
-        f"",
-        f"% ── Dimensions ──────────────────────────────────────",
-        f"n              = {n};",
-        f"n_resources    = {n_res};    % ressources renouvelables",
-        f"n_nr_resources = {n_nr};    % ressources non-renouvelables",
-        f"horizon        = {H};",
-        f"",
-        f"% ── Durées ───────────────────────────────────────────",
-        f"duration       = {data['durations']};",
-        f"",
-        f"% ── Ressources renouvelables ─────────────────────────",
-        f"resource_avail = {data['caps']};",
-        f"req = array2d(1..n, 1..n_resources, [",
-        f"    " + ", ".join(str(x) for x in flat_r),
-        f"]);",
-        f"",
-        f"% ── Ressources non-renouvelables ─────────────────────",
-        f"nr_resource_avail = {data['nr_caps']};",
-        f"nr_req = array2d(1..n, 1..n_nr_resources, [",
-        f"    " + ", ".join(str(x) for x in flat_nr),
-        f"]);",
-        f"",
-        f"% ── Précédences ──────────────────────────────────────",
-        f"precedence = array2d(1..n, 1..n, [",
-        f"    " + ", ".join(str(x) for x in prec_flat),
-        f"]);",
-        f"n_prec = {data['n_prec']};",
-        f"",
-        f"% ── Contraintes climatiques (fenêtre estivale) ───────",
-        f"% Tâches de bétonnage interdites du jour {cl['summer_start']} au jour {cl['summer_end']}",
-        f"summer_start = {cl['summer_start']};   % 1er juin",
-        f"summer_end   = {cl['summer_end']};   % 30 septembre",
-        f"big_M        = {cl['big_m']};",
-        f"working_days_only = {'true' if cl['working_days_only'] else 'false'};",
-        f"",
-        f"% ── Tâches de bétonnage ──────────────────────────────",
-        f"% Sous-ensemble : {ct}",
-        f"n_concrete_tasks = {len(ct)};",
-        f"concrete_tasks   = {ct};",
-        f"is_concrete      = {is_concrete};   % masque binaire",
-        f"",
-        f"% === FIN ===",
-    ]
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
-    print(f"  [BTP-ENRICH] {out_path}  (n={n}, H={H}, béton={ct})")
+    # ── Tableau récapitulatif ──
+    if results:
+        print(f"\n{'═'*72}")
+        print(f"{'Instance':<20} {'n':>5} {'H':>6} {'RR':>4} {'NR':>4} "
+              f"{'Béton':>7} {'Climatique':>11}")
+        print(f"{'─'*72}")
+        for inst in results:
+            clim = "✓ réelle" if inst.n_NR > 0 else "heuristique"
+            print(f"{inst.name:<20} {inst.n_jobs:>5} {inst.horizon:>6} "
+                  f"{inst.n_RR:>4} {inst.n_NR:>4} {len(inst.concrete_tasks):>7} {clim:>11}")
+        print(f"{'═'*72}")
+        print(f"\n✅  {len(results)} fichier(s) .dzn → {out_dir}/\n")
 
 
-# ===========================================================================
-# 8. MAIN
-# ===========================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="Parser PSPLIB unifié → .dzn")
-    parser.add_argument("--input",  "-i", default="instancesdebtp.docx")
-    parser.add_argument("--outdir", "-o", default="dzn_output")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Parser BTP → .dzn MiniZinc (Projet P2 INSEA)")
+    ap.add_argument("--docx",     default="instancesdebtp.docx",
+                    help="Chemin vers le fichier .docx (défaut : instancesdebtp.docx)")
+    ap.add_argument("--out",  "-o", default="dzn_output",
+                    help="Dossier de sortie des .dzn  (défaut : dzn_output/)")
+    ap.add_argument("--instance", "-i", metavar="NOM",
+                    help="Générer une seule instance (ex: CASA-LYC-14, j30_17)")
+    ap.add_argument("--list", "-l", action="store_true",
+                    help="Lister les instances détectées sans générer")
+    args = ap.parse_args()
 
-    print(f"Chargement : {args.input}")
-    raw = load_raw_text(args.input)
+    # Résoudre le chemin du docx
+    docx_path = Path(args.docx)
+    if not docx_path.exists():
+        # Chercher à côté du script
+        alt = Path(__file__).parent / args.docx
+        if alt.exists():
+            docx_path = alt
+        else:
+            sys.exit(f"❌  Fichier introuvable : {args.docx}")
 
-    all_blocks = re.split(
-        r'(?=(?:\*{5,}\s*file with basedata\s*:\s*\S+|file with basedata\s*:\s*\S+|j\d+_\d+\.sm))',
-        raw, flags=re.IGNORECASE
-    )
+    if args.list:
+        text   = read_docx(str(docx_path))
+        blocks = split_into_blocks(text)
+        print(f"Instances dans {docx_path} :")
+        for name, chunk in blocks:
+            inst = Instance(name=name)
+            parse_header(chunk, inst)
+            tag = " [ÉTENDUE]" if is_moroccan(chunk) else ""
+            print(f"  {name:<20}  {inst.n_jobs} tâches  H={inst.horizon}{tag}")
+        return
 
-    valid_blocks = [
-        b.strip() for b in all_blocks
-        if b.strip()
-        and 'PRECEDENCE' in b
-        and 'REQUESTS'   in b
-        and 'RESOURCE'   in b
-        and re.search(r'jobs.*?[:=]\s*\d+', b, re.IGNORECASE)
-    ]
-
-    if not valid_blocks:
-        print("ERREUR : Aucun bloc valide trouvé.", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"{len(valid_blocks)} instance(s) détectée(s)\n")
-    os.makedirs(args.outdir, exist_ok=True)
-
-    for block in valid_blocks:
-        try:
-            data     = parse_block(block)
-            dzn_path = os.path.join(args.outdir, f"{data['stem']}.dzn")
-            if data['inst_type'] == 'BTP-ENRICH':
-                to_dzn_btp_enrich(data, dzn_path)
-            else:
-                to_dzn_standard(data, dzn_path)
-        except Exception as e:
-            print(f"  ERREUR sur un bloc : {e}", file=sys.stderr)
-
-    print(f"\nFichiers .dzn écrits dans : {args.outdir}/")
+    run(str(docx_path), args.out, only=args.instance)
 
 
 if __name__ == "__main__":
