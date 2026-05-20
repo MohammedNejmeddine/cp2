@@ -1,0 +1,6 @@
+cd "C:\Users\nejme\Downloads\projet cp"
+Set-Content requirements.txt "streamlit
+plotly
+pandas
+numpy
+"
