@@ -6,7 +6,7 @@ Dashboard interactif pour comparer les instances PSPLIB (J30/J60/J90/J120)
 avec l'instance BTP enrichie CASA-LYC-14.
 
 Usage:
-    streamlit run benchmark/benchmark_streamlit.py
+    streamlit run cp2/benchmark/benchmark_streamlit.py
 
 Prérequis:
     pip install streamlit plotly pandas
@@ -449,7 +449,7 @@ def highlight_status(val):
     return ''
 
 st.dataframe(
-    df_display.style.applymap(highlight_status, subset=['status']),
+    df_display.style.map(highlight_status, subset=['status']),
     use_container_width=True,
     height=350
 )
